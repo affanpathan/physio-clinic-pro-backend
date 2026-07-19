@@ -511,4 +511,8 @@ app.delete('/api/appointments/:id', async (req, res) => {
 });
 
 const PORT = process.env.SERVER_PORT || 5000;
+
+
+// CRITICAL: Export the app for Vercel, do not call app.listen() when running on Vercel
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+module.exports = app; 
