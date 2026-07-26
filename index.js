@@ -131,6 +131,11 @@ async function initDB() {
 
 initDB().catch(console.error);
 
+// Add this to verify your API server is alive
+app.get('/', (req, res) => {
+  res.status(200).json({ status: "success", message: "Physio Clinic API is running smoothly!" });
+});
+
 // ---- PATIENTS ----
 app.get('/api/patients', async (req, res) => {
   try {
