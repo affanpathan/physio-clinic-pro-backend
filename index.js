@@ -479,7 +479,16 @@ app.get('/api/dashboard', async (req, res) => {
       recent_visits: recentVisits.rows,
       weekly_data: weeklyData.rows,
     });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) {
+    // res.status(500).json({ error: err.message });
+    console.error("Dashboard query failed:", err.message);
+    
+    res.status(500).json({ 
+      status: "error", 
+      message: "Failed to retrieve dashboard records.",
+      details: err.message 
+    });
+  }
 });
 
 // ---- APPOINTMENTS ----
