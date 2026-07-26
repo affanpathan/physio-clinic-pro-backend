@@ -15,6 +15,8 @@ const pool = new Pool({
   password: process.env.DB_PASSWORD || 'admin',
 });
 
+console.log(host, port, databse, user, password);
+
 const normalizeDate = (value) => {
   if (!value) return null;
   if (/^\d{4}-\d{2}-\d{2}$/.test(value)) return value;
