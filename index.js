@@ -7,12 +7,15 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+const isProduction = process.env.NODE_ENV === 'production' || process.env.VERCEL === '1';
+
 const pool = new Pool({
   host: process.env.DB_HOST || 'localhost',
   port: process.env.DB_PORT || 5432,
   database: process.env.DB_NAME || 'physio_db',
   user: process.env.DB_USER || 'postgres',
   password: process.env.DB_PASSWORD || 'admin',
+  ssl: isProduction ? { rejectUnauthorized: false } : false
 });
 
 console.log(host, port, databse, user, password);
@@ -131,9 +134,23 @@ async function initDB() {
 
 initDB().catch(console.error);
 
-// Add this to verify your API server is alive
-app.get('/', (req, res) => {
-  res.status(200).json({ status: "success", message: "Physio Clinic API is running smoothly!" });
+// Root check route to quickly verify function invocation works
+app.get('/', async (req, res) => {
+  try {
+    // Quick query test to see if DB is truly working
+    const result = await pool.query('SELECT NOW()');
+    res.status(200).json({ 
+      status: "success", 
+      message: "Physio Clinic API is alive!",
+      database_time: result.rows[0].now 
+    });
+  } catch (err) {
+    res.status(500).json({ 
+      status: "error", 
+      message: "Server is up, but Database connection failed.",
+      details: err.message 
+    });
+  }
 });
 
 // ---- PATIENTS ----
