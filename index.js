@@ -24,7 +24,10 @@ const pool = new Pool({
   ssl: isProduction ? { rejectUnauthorized: false } : false
 });
 
-
+pool.on('error', (err) => {
+  console.error('Unexpected error on idle PostgreSQL client:', err.message);
+  // Do not exit the process; let Vercel handle recycling the serverless container
+});
 
 const normalizeDate = (value) => {
   if (!value) return null;
