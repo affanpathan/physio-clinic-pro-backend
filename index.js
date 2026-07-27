@@ -485,7 +485,7 @@ app.get('/api/dashboard', async (req, res) => {
   } catch (err) {
     // res.status(500).json({ error: err.message });
     console.error("Dashboard query failed:", err.message);
-    
+    console.error(JSON.stringify(err, null, 2));
     res.status(500).json({ 
       status: "error", 
       message: "Failed to retrieve dashboard records.",
