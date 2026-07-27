@@ -8,21 +8,21 @@ app.use(cors());
 app.use(express.json());
 
 const isProduction = process.env.NODE_ENV === 'production' || process.env.VERCEL === '1';
-console.log(process.env.DB_HOST, process.env.DB_PORT, process.env.DB_NAME, process.env.DB_USER, process.env.DB_PASSWORD,process.env.DATABASE_URL);
-const pool = new Pool({
-  host: process.env.DB_HOST || 'localhost',
-  port: process.env.DB_PORT || 5432,
-  database: process.env.DB_NAME || 'physio_db',
-  user: process.env.DB_USER || 'postgres',
-  password: process.env.DB_PASSWORD || 'admin',
-  ssl: isProduction ? { rejectUnauthorized: false } : false
-});
-
+// console.log(process.env.DB_HOST, process.env.DB_PORT, process.env.DB_NAME, process.env.DB_USER, process.env.DB_PASSWORD,process.env.DATABASE_URL);
 // const pool = new Pool({
-//   // If DATABASE_URL is present, it overrides all other individual parameters automatically
-//   connectionString: process.env.DATABASE_URL || `postgres://${process.env.DB_USER || 'postgres'}:${process.env.DB_PASSWORD || 'admin'}@${process.env.DB_HOST || 'localhost'}:${process.env.DB_PORT || 5432}/${process.env.DB_NAME || 'physio_db'}`,
+//   host: process.env.DB_HOST || 'localhost',
+//   port: process.env.DB_PORT || 5432,
+//   database: process.env.DB_NAME || 'physio_db',
+//   user: process.env.DB_USER || 'postgres',
+//   password: process.env.DB_PASSWORD || 'admin',
 //   ssl: isProduction ? { rejectUnauthorized: false } : false
 // });
+
+const pool = new Pool({
+  // If DATABASE_URL is present, it overrides all other individual parameters automatically
+  connectionString: process.env.DATABASE_URL || `postgres://${process.env.DB_USER || 'postgres'}:${process.env.DB_PASSWORD || 'admin'}@${process.env.DB_HOST || 'localhost'}:${process.env.DB_PORT || 5432}/${process.env.DB_NAME || 'physio_db'}`,
+  ssl: isProduction ? { rejectUnauthorized: false } : false
+});
 
 pool.on('error', (err) => {
   console.error('Unexpected error on idle PostgreSQL client:', err.message);
