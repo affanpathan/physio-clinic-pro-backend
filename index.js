@@ -1,28 +1,73 @@
 const express = require('express');
 const cors = require('cors');
+const fs = require('fs');
+const path = require('path');
 const { Pool } = require('pg');
-require('dotenv').config();
+const bcrypt = require("bcrypt");
+const jwt = require("jsonwebtoken");
+
+const localEnvPath = path.resolve(__dirname, '.env');
+const frontendEnvPath = path.resolve(__dirname, '..', 'frontend', '.env');
+const envPath = fs.existsSync(localEnvPath) ? localEnvPath : fs.existsSync(frontendEnvPath) ? frontendEnvPath : localEnvPath;
+const dotenvResult = require('dotenv').config({ path: envPath });
+console.log('Loaded env path:', envPath, 'dotenv error:', dotenvResult.error ? dotenvResult.error.message : null);
+console.log('SYS_ADMIN configured:', Boolean(process.env.SYS_ADMIN), 'length:', process.env.SYS_ADMIN ? process.env.SYS_ADMIN.length : 0);
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-const isProduction = process.env.NODE_ENV === 'production' || process.env.VERCEL === '1';
-// console.log(process.env.DB_HOST, process.env.DB_PORT, process.env.DB_NAME, process.env.DB_USER, process.env.DB_PASSWORD,process.env.DATABASE_URL);
-// const pool = new Pool({
-//   host: process.env.DB_HOST || 'localhost',
-//   port: process.env.DB_PORT || 5432,
-//   database: process.env.DB_NAME || 'physio_db',
-//   user: process.env.DB_USER || 'postgres',
-//   password: process.env.DB_PASSWORD || 'admin',
-//   ssl: isProduction ? { rejectUnauthorized: false } : false
-// });
+const JWT_SECRET = process.env.JWT_SECRET || 'supersecretjwtkey';
+const ADMIN_JWT_SECRET = process.env.ADMIN_JWT_SECRET || JWT_SECRET;
 
-const pool = new Pool({
-  // If DATABASE_URL is present, it overrides all other individual parameters automatically
-  connectionString: process.env.DATABASE_URL || `postgres://${process.env.DB_USER || 'postgres'}:${process.env.DB_PASSWORD || 'admin'}@${process.env.DB_HOST || 'localhost'}:${process.env.DB_PORT || 5432}/${process.env.DB_NAME || 'physio_db'}`,
-  ssl: isProduction ? { rejectUnauthorized: false } : false
-});
+function authenticateToken(req, res, next) {
+  if (req.path === '/clinic-users/login' || req.path === '/' || req.path === '/admin/validate') {
+    return next();
+  }
+
+  const authHeader = req.get('authorization') || '';
+  if (!authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ success: false, error: 'Unauthorized' });
+  }
+
+  const token = authHeader.slice(7);
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    req.userId = payload.userId;
+    req.userName = payload.userName;
+    req.clinicId = payload.clinicId;
+    req.isAdmin = Boolean(payload.role === 'admin');
+    next();
+  } catch (err) {
+    try {
+      const payload = jwt.verify(token, ADMIN_JWT_SECRET);
+      req.isAdmin = Boolean(payload.role === 'admin');
+      next();
+    } catch (_err) {
+      return res.status(401).json({ success: false, error: 'Invalid token' });
+    }
+  }
+}
+
+app.use('/api', authenticateToken);
+
+const isProduction = process.env.NODE_ENV === 'production' || process.env.VERCEL === '1';
+const dbPassword = String(process.env.DB_PASSWORD ?? process.env.PGPASSWORD ?? 'admin');
+const dbConfig = {
+  host: process.env.DB_HOST || 'localhost',
+  port: Number(process.env.DB_PORT || 5432),
+  database: process.env.DB_NAME || 'physio_db',
+  user: process.env.DB_USER || 'postgres',
+  password: dbPassword,
+  ssl: isProduction ? { rejectUnauthorized: false } : false,
+};
+
+const pool = process.env.DATABASE_URL
+  ? new Pool({
+      connectionString: process.env.DATABASE_URL,
+      ssl: isProduction ? { rejectUnauthorized: false } : false,
+    })
+  : new Pool(dbConfig);
 
 pool.on('error', (err) => {
   console.error('Unexpected error on idle PostgreSQL client:', err.message);
@@ -42,6 +87,7 @@ async function initDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS patients (
       id SERIAL PRIMARY KEY,
+      clinic_id INTEGER REFERENCES clinic_master(id) ON DELETE CASCADE,
       patient_id VARCHAR(20) UNIQUE NOT NULL,
       first_name VARCHAR(100) NOT NULL,
       last_name VARCHAR(100) NOT NULL,
@@ -60,6 +106,7 @@ async function initDB() {
 
     CREATE TABLE IF NOT EXISTS therapy_plans (
       id SERIAL PRIMARY KEY,
+      clinic_id INTEGER REFERENCES clinic_master(id) ON DELETE CASCADE,
       patient_id INTEGER REFERENCES patients(id) ON DELETE CASCADE,
       plan_name VARCHAR(200) NOT NULL,
       total_sessions INTEGER DEFAULT 0,
@@ -74,6 +121,7 @@ async function initDB() {
 
     CREATE TABLE IF NOT EXISTS visits (
       id SERIAL PRIMARY KEY,
+      clinic_id INTEGER REFERENCES clinic_master(id) ON DELETE CASCADE,
       patient_id INTEGER REFERENCES patients(id) ON DELETE CASCADE,
       therapy_plan_id INTEGER REFERENCES therapy_plans(id) ON DELETE SET NULL,
       visit_date DATE NOT NULL,
@@ -93,6 +141,7 @@ async function initDB() {
 
     CREATE TABLE IF NOT EXISTS patient_payments (
       id SERIAL PRIMARY KEY,
+      clinic_id INTEGER REFERENCES clinic_master(id) ON DELETE CASCADE,
       patient_id INTEGER REFERENCES patients(id) ON DELETE CASCADE,
       visit_id INTEGER REFERENCES visits(id) ON DELETE SET NULL,
       payment_date DATE NOT NULL,
@@ -105,6 +154,7 @@ async function initDB() {
 
     CREATE TABLE IF NOT EXISTS daily_ledger (
       id SERIAL PRIMARY KEY,
+      clinic_id INTEGER REFERENCES clinic_master(id) ON DELETE CASCADE,
       entry_date DATE NOT NULL,
       entry_type VARCHAR(20) NOT NULL,
       category VARCHAR(100),
@@ -119,6 +169,7 @@ async function initDB() {
 
     CREATE TABLE IF NOT EXISTS appointments (
       id SERIAL PRIMARY KEY,
+      clinic_id INTEGER REFERENCES clinic_master(id) ON DELETE CASCADE,
       patient_id INTEGER REFERENCES patients(id) ON DELETE CASCADE,
       therapist_name VARCHAR(150),
       appointment_date DATE NOT NULL,
@@ -131,9 +182,48 @@ async function initDB() {
       updated_at TIMESTAMP DEFAULT NOW()
     );
 
+    CREATE TABLE IF NOT EXISTS clinic_master (
+      id SERIAL PRIMARY KEY,
+      clinic_name VARCHAR(200) NOT NULL,
+      clinic_person VARCHAR(200),
+      clinic_phone VARCHAR(30),
+      clinic_address TEXT,
+      clinic_city VARCHAR(100),
+      clinic_state VARCHAR(100),
+      clinic_country VARCHAR(100),
+      last_date DATE,
+      clinic_active BOOLEAN DEFAULT TRUE,
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS clinic_users (
+      id SERIAL PRIMARY KEY,
+      clinic_id INTEGER REFERENCES clinic_master(id) ON DELETE CASCADE,
+      user_name VARCHAR(200) NOT NULL,
+      user_id VARCHAR(200) NOT NULL,
+      user_pass VARCHAR(200) NOT NULL,
+      active BOOLEAN DEFAULT TRUE,
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+
+    ALTER TABLE patients ADD COLUMN IF NOT EXISTS clinic_id INTEGER REFERENCES clinic_master(id) ON DELETE CASCADE;
+    ALTER TABLE therapy_plans ADD COLUMN IF NOT EXISTS clinic_id INTEGER REFERENCES clinic_master(id) ON DELETE CASCADE;
+    ALTER TABLE visits ADD COLUMN IF NOT EXISTS clinic_id INTEGER REFERENCES clinic_master(id) ON DELETE CASCADE;
+    ALTER TABLE patient_payments ADD COLUMN IF NOT EXISTS clinic_id INTEGER REFERENCES clinic_master(id) ON DELETE CASCADE;
+    ALTER TABLE daily_ledger ADD COLUMN IF NOT EXISTS clinic_id INTEGER REFERENCES clinic_master(id) ON DELETE CASCADE;
+    ALTER TABLE appointments ADD COLUMN IF NOT EXISTS clinic_id INTEGER REFERENCES clinic_master(id) ON DELETE CASCADE;
+
     CREATE INDEX IF NOT EXISTS idx_visits_patient ON visits(patient_id);
     CREATE INDEX IF NOT EXISTS idx_visits_date ON visits(visit_date);
     CREATE INDEX IF NOT EXISTS idx_ledger_date ON daily_ledger(entry_date);
+    CREATE INDEX IF NOT EXISTS idx_patients_clinic ON patients(clinic_id);
+    CREATE INDEX IF NOT EXISTS idx_therapy_plans_clinic ON therapy_plans(clinic_id);
+    CREATE INDEX IF NOT EXISTS idx_visits_clinic ON visits(clinic_id);
+    CREATE INDEX IF NOT EXISTS idx_payments_clinic ON patient_payments(clinic_id);
+    CREATE INDEX IF NOT EXISTS idx_ledger_clinic ON daily_ledger(clinic_id);
+    CREATE INDEX IF NOT EXISTS idx_appointments_clinic ON appointments(clinic_id);
     CREATE INDEX IF NOT EXISTS idx_payments_patient ON patient_payments(patient_id);
     CREATE INDEX IF NOT EXISTS idx_appointments_patient ON appointments(patient_id);
     CREATE INDEX IF NOT EXISTS idx_appointments_date ON appointments(appointment_date);
@@ -162,12 +252,264 @@ app.get('/', async (req, res) => {
   }
 });
 
+// ---- CLINIC MASTER ----
+app.get('/api/clinic-master', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM clinic_master ORDER BY id ASC');
+    res.json(result.rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/clinic-master/:id', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM clinic_master WHERE id = $1', [req.params.id]);
+    if (!result.rows.length) return res.status(404).json({ error: 'Not found' });
+    res.json(result.rows[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/clinic-master', async (req, res) => {
+  try {
+    const { clinic_name, clinic_person, clinic_phone, clinic_address, clinic_city, clinic_state, clinic_country, last_date, clinic_active } = req.body;
+    const result = await pool.query(
+      `INSERT INTO clinic_master (clinic_name, clinic_person, clinic_phone, clinic_address, clinic_city, clinic_state, clinic_country, last_date, clinic_active)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
+      [clinic_name, clinic_person || '', clinic_phone || '', clinic_address || '', clinic_city || '', clinic_state || '', clinic_country || '', last_date || null, clinic_active !== undefined ? clinic_active : true]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.put('/api/clinic-master/:id', async (req, res) => {
+  try {
+    const { clinic_name, clinic_person, clinic_phone, clinic_address, clinic_city, clinic_state, clinic_country, last_date, clinic_active } = req.body;
+    const result = await pool.query(
+      `UPDATE clinic_master
+       SET clinic_name = $1, clinic_person = $2, clinic_phone = $3, clinic_address = $4, clinic_city = $5,
+           clinic_state = $6, clinic_country = $7, last_date = $8, clinic_active = $9, updated_at = NOW()
+       WHERE id = $10 RETURNING *`,
+      [clinic_name, clinic_person || '', clinic_phone || '', clinic_address || '', clinic_city || '', clinic_state || '', clinic_country || '', last_date || null, clinic_active !== undefined ? clinic_active : true, req.params.id]
+    );
+    if (!result.rows.length) return res.status(404).json({ error: 'Not found' });
+    res.json(result.rows[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete('/api/clinic-master/:id', async (req, res) => {
+  try {
+    const result = await pool.query('DELETE FROM clinic_master WHERE id = $1 RETURNING id', [req.params.id]);
+    if (!result.rows.length) return res.status(404).json({ error: 'Not found' });
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ---- CLINIC USERS ----
+app.get('/api/clinic-users', async (req, res) => {
+  try {
+    const query = req.clinicId
+      ? `SELECT cu.*, cm.clinic_name FROM clinic_users cu LEFT JOIN clinic_master cm ON cu.clinic_id = cm.id WHERE cu.clinic_id = $1 ORDER BY cu.id ASC`
+      : `SELECT cu.*, cm.clinic_name FROM clinic_users cu LEFT JOIN clinic_master cm ON cu.clinic_id = cm.id ORDER BY cu.id ASC`;
+    const params = req.clinicId ? [req.clinicId] : [];
+    const result = await pool.query(query, params);
+    res.json(result.rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/clinic-users/:id', async (req, res) => {
+  try {
+    const query = req.clinicId
+      ? `SELECT cu.*, cm.clinic_name FROM clinic_users cu LEFT JOIN clinic_master cm ON cu.clinic_id = cm.id WHERE cu.id = $1 AND cu.clinic_id = $2`
+      : `SELECT cu.*, cm.clinic_name FROM clinic_users cu LEFT JOIN clinic_master cm ON cu.clinic_id = cm.id WHERE cu.id = $1`;
+    const params = req.clinicId ? [req.params.id, req.clinicId] : [req.params.id];
+    const result = await pool.query(query, params);
+    if (!result.rows.length) return res.status(404).json({ error: 'Not found' });
+    res.json(result.rows[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/clinic-users/login', async (req, res) => {
+  try {
+    console.log('login called============');
+    const { user_id, user_pass } = req.body;
+    if (!user_id || !user_pass) {
+      return res.status(400).json({ success: false, error: 'User ID and password are required.' });
+    }
+
+    console.log(user_id, user_pass);
+    const result = await pool.query(
+      `SELECT id, clinic_id, user_name, user_id, user_pass, active
+      FROM clinic_users
+      WHERE LOWER(TRIM(user_id)) = LOWER(TRIM($1))
+        AND active = TRUE`,
+      [String(user_id).trim()]
+    );
+
+    console.log(result.rows, result.rows.length);
+    if (result.rows.length === 0) {
+      return res.status(401).json({
+        success: false,
+        error: "Invalid user ID or password."
+      });
+    }
+
+    const userRecord = result.rows[0];
+    const storedPassword = String(userRecord.user_pass || '');
+    let isPasswordValid = false;
+
+    console.log(userRecord, storedPassword, isPasswordValid);
+    if (/^\$2[aby]\$/.test(storedPassword)) {
+      isPasswordValid = await bcrypt.compare(user_pass, storedPassword);
+      console.log('validated', isPasswordValid);
+    } else {
+      isPasswordValid = user_pass === storedPassword;
+      console.log('migrated', isPasswordValid);
+      if (isPasswordValid) {
+        const migratedHash = await bcrypt.hash(user_pass, 10);
+        await pool.query('UPDATE clinic_users SET user_pass = $1 WHERE id = $2', [migratedHash, userRecord.id]);
+      }
+    }
+
+    if (!isPasswordValid) {
+      return res.status(401).json({
+        success: false,
+        error: "Invalid user ID or password."
+      });
+    }
+
+    const clinicResult = await pool.query(
+      `SELECT clinic_name, last_date, clinic_active FROM clinic_master WHERE id = $1`,
+      [userRecord.clinic_id]
+    );
+
+    const clinicRow = clinicResult.rows[0] || {};
+    const clinicName = clinicRow.clinic_name || '';
+    const clinicExpiry = clinicRow.last_date ? new Date(clinicRow.last_date) : null;
+    const clinicActive = clinicRow.clinic_active !== false;
+    const subscriptionExpired = clinicExpiry ? clinicExpiry < new Date(new Date().toISOString().split('T')[0]) : false;
+
+    if (!userRecord.active || !clinicActive || subscriptionExpired) {
+      return res.status(403).json({
+        success: false,
+        error: 'Your subscription has expired. Please contact the service provider to renew your subscription and continue using the application.'
+      });
+    }
+
+    const token = jwt.sign(
+      {
+        userId: userRecord.id,
+        userName: userRecord.user_name,
+        clinicId: userRecord.clinic_id,
+      },
+      JWT_SECRET,
+      { expiresIn: '8h' }
+    );
+
+    res.json({
+      success: true,
+      token,
+      clinic_id: userRecord.clinic_id,
+      user: {
+        id: userRecord.id,
+        clinic_id: userRecord.clinic_id,
+        user_name: userRecord.user_name,
+        user_id: userRecord.user_id,
+        active: userRecord.active,
+        clinic_name: clinicName,
+      },
+      clinic_name: clinicName,
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.post('/api/admin/validate', async (req, res) => {
+  try {
+    const { password } = req.body;
+    if (!password) {
+      return res.status(400).json({ success: false, error: 'Admin password is required.' });
+    }
+    const sysAdminPassword = String(process.env.SYS_ADMIN || '').trim();
+    if (!sysAdminPassword) {
+      return res.status(500).json({ success: false, error: 'Admin password is not configured.' });
+    }
+    const providedPassword = String(password || '').trim();
+    if (providedPassword !== sysAdminPassword) {
+      return res.status(401).json({ success: false, error: 'Invalid admin password.' });
+    }
+    const adminToken = jwt.sign({ role: 'admin' }, ADMIN_JWT_SECRET, { expiresIn: '8h' });
+    res.json({ success: true, adminToken });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.post('/api/clinic-users', async (req, res) => {
+  try {
+    const { clinic_id, user_name, user_id, user_pass, active } = req.body;
+    // Hash the password
+    const hashedPassword = await bcrypt.hash(user_pass, 10);
+    const result = await pool.query(
+      `INSERT INTO clinic_users (clinic_id, user_name, user_id, user_pass, active)
+       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+      [clinic_id || req.clinicId || null, user_name, user_id, hashedPassword, active !== undefined ? active : true]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.put('/api/clinic-users/:id', async (req, res) => {
+  try {
+    const { clinic_id, user_name, user_id, user_pass, active } = req.body;
+    const isActive = active !== undefined ? active : true;
+    const targetClinicId = clinic_id || req.clinicId || null;
+    const clinicFilter = req.clinicId && !req.isAdmin ? ' AND clinic_id = $7' : '';
+
+    if (typeof user_pass === 'string' && user_pass.length > 0) {
+      const hashedPassword = await bcrypt.hash(user_pass, 10);
+      const query = req.clinicId && !req.isAdmin
+        ? `UPDATE clinic_users SET clinic_id = $1, user_name = $2, user_id = $3, user_pass = $4, active = $5, updated_at = NOW() WHERE id = $6${clinicFilter} RETURNING *`
+        : `UPDATE clinic_users SET clinic_id = $1, user_name = $2, user_id = $3, user_pass = $4, active = $5, updated_at = NOW() WHERE id = $6 RETURNING *`;
+      const params = req.clinicId && !req.isAdmin
+        ? [targetClinicId, user_name, user_id, hashedPassword, isActive, req.params.id, req.clinicId]
+        : [targetClinicId, user_name, user_id, hashedPassword, isActive, req.params.id];
+      const result = await pool.query(query, params);
+      if (!result.rows.length) return res.status(404).json({ error: 'Not found' });
+      return res.json(result.rows[0]);
+    }
+
+    const query = req.clinicId && !req.isAdmin
+      ? `UPDATE clinic_users SET clinic_id = $1, user_name = $2, user_id = $3, active = $4, updated_at = NOW() WHERE id = $5${clinicFilter} RETURNING *`
+      : `UPDATE clinic_users SET clinic_id = $1, user_name = $2, user_id = $3, active = $4, updated_at = NOW() WHERE id = $5 RETURNING *`;
+    const params = req.clinicId && !req.isAdmin
+      ? [targetClinicId, user_name, user_id, isActive, req.params.id, req.clinicId]
+      : [targetClinicId, user_name, user_id, isActive, req.params.id];
+    const result = await pool.query(query, params);
+    if (!result.rows.length) return res.status(404).json({ error: 'Not found' });
+    res.json(result.rows[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete('/api/clinic-users/:id', async (req, res) => {
+  try {
+    const query = req.clinicId ? 'DELETE FROM clinic_users WHERE id = $1 AND clinic_id = $2 RETURNING id' : 'DELETE FROM clinic_users WHERE id = $1 RETURNING id';
+    const params = req.clinicId ? [req.params.id, req.clinicId] : [req.params.id];
+    const result = await pool.query(query, params);
+    if (!result.rows.length) return res.status(404).json({ error: 'Not found' });
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // ---- PATIENTS ----
 app.get('/api/patients', async (req, res) => {
   try {
     const { search, active } = req.query;
     let query = 'SELECT * FROM patients WHERE 1=1';
     const params = [];
+    if (req.clinicId) {
+      params.push(req.clinicId);
+      query += ` AND clinic_id = $${params.length}`;
+    }
     if (search) {
       params.push(`%${search}%`);
       query += ` AND (first_name ILIKE $${params.length} OR last_name ILIKE $${params.length} OR patient_id ILIKE $${params.length} OR phone ILIKE $${params.length})`;
@@ -184,7 +526,10 @@ app.get('/api/patients', async (req, res) => {
 
 app.get('/api/patients/:id', async (req, res) => {
   try {
-    const result = await pool.query('SELECT * FROM patients WHERE id = $1', [req.params.id]);
+    const result = await pool.query(
+      req.clinicId ? 'SELECT * FROM patients WHERE id = $1 AND clinic_id = $2' : 'SELECT * FROM patients WHERE id = $1',
+      req.clinicId ? [req.params.id, req.clinicId] : [req.params.id]
+    );
     if (!result.rows.length) return res.status(404).json({ error: 'Not found' });
     res.json(result.rows[0]);
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -196,9 +541,9 @@ app.post('/api/patients', async (req, res) => {
     const countRes = await pool.query('SELECT COUNT(*) FROM patients');
     const patient_id = `PT${String(parseInt(countRes.rows[0].count) + 1001).padStart(5,'0')}`;
     const result = await pool.query(
-      `INSERT INTO patients (patient_id, first_name, last_name, phone, email, date_of_birth, gender, address, diagnosis, referring_doctor, notes)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
-      [patient_id, first_name, last_name, phone, email, date_of_birth, gender, address, diagnosis, referring_doctor, notes]
+      `INSERT INTO patients (clinic_id, patient_id, first_name, last_name, phone, email, date_of_birth, gender, address, diagnosis, referring_doctor, notes)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`,
+      [req.clinicId || null, patient_id, first_name, last_name, phone, email, date_of_birth, gender, address, diagnosis, referring_doctor, notes]
     );
     res.status(201).json(result.rows[0]);
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -208,10 +553,16 @@ app.put('/api/patients/:id', async (req, res) => {
   try {
     const { first_name, last_name, phone, email, date_of_birth, gender, address, diagnosis, referring_doctor, notes, is_active } = req.body;
     const result = await pool.query(
-      `UPDATE patients SET first_name=$1, last_name=$2, phone=$3, email=$4, date_of_birth=$5, gender=$6,
-       address=$7, diagnosis=$8, referring_doctor=$9, notes=$10, is_active=$11, updated_at=NOW()
-       WHERE id=$12 RETURNING *`,
-      [first_name, last_name, phone, email, date_of_birth, gender, address, diagnosis, referring_doctor, notes, is_active, req.params.id]
+      req.clinicId
+        ? `UPDATE patients SET first_name=$1, last_name=$2, phone=$3, email=$4, date_of_birth=$5, gender=$6,
+           address=$7, diagnosis=$8, referring_doctor=$9, notes=$10, is_active=$11, updated_at=NOW()
+           WHERE id=$12 AND clinic_id=$13 RETURNING *`
+        : `UPDATE patients SET first_name=$1, last_name=$2, phone=$3, email=$4, date_of_birth=$5, gender=$6,
+           address=$7, diagnosis=$8, referring_doctor=$9, notes=$10, is_active=$11, updated_at=NOW()
+           WHERE id=$12 RETURNING *`,
+      req.clinicId
+        ? [first_name, last_name, phone, email, date_of_birth, gender, address, diagnosis, referring_doctor, notes, is_active, req.params.id, req.clinicId]
+        : [first_name, last_name, phone, email, date_of_birth, gender, address, diagnosis, referring_doctor, notes, is_active, req.params.id]
     );
     res.json(result.rows[0]);
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -224,6 +575,10 @@ app.get('/api/visits', async (req, res) => {
     let query = `SELECT v.*, p.first_name, p.last_name, p.patient_id as pid 
                  FROM visits v JOIN patients p ON v.patient_id = p.id WHERE 1=1`;
     const params = [];
+    if (req.clinicId) {
+      params.push(req.clinicId);
+      query += ` AND v.clinic_id = $${params.length}`;
+    }
     if (patient_id) { params.push(patient_id); query += ` AND v.patient_id = $${params.length}`; }
     if (date) { params.push(date); query += ` AND v.visit_date = $${params.length}`; }
     if (date_from) { params.push(date_from); query += ` AND v.visit_date >= $${params.length}`; }
@@ -245,24 +600,24 @@ app.post('/api/visits', async (req, res) => {
     const normalizedVisitDate = normalizeDate(visit_date);
     
     const visitResult = await client.query(
-      `INSERT INTO visits (patient_id, therapy_plan_id, visit_date, visit_time, therapist_name, therapy_type,
+      `INSERT INTO visits (clinic_id, patient_id, therapy_plan_id, visit_date, visit_time, therapist_name, therapy_type,
         duration_minutes, fee_charged, amount_paid, payment_method, payment_status, session_notes, chief_complaint, treatment_given)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *`,
-      [patient_id, therapy_plan_id || null, normalizedVisitDate, visit_time, therapist_name, therapy_type,
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING *`,
+      [req.clinicId || null, patient_id, therapy_plan_id || null, normalizedVisitDate, visit_time, therapist_name, therapy_type,
        duration_minutes || 60, fee_charged || 0, amount_paid || 0, payment_method, payment_status, session_notes, chief_complaint, treatment_given]
     );
     const visit = visitResult.rows[0];
 
     if (amount_paid > 0) {
       await client.query(
-        `INSERT INTO patient_payments (patient_id, visit_id, payment_date, amount, payment_method, notes)
-         VALUES ($1,$2,$3,$4,$5,$6)`,
-        [patient_id, visit.id, normalizedVisitDate, amount_paid, payment_method, `Visit payment - ${normalizedVisitDate}`]
+        `INSERT INTO patient_payments (clinic_id, patient_id, visit_id, payment_date, amount, payment_method, notes)
+         VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+        [req.clinicId || null, patient_id, visit.id, normalizedVisitDate, amount_paid, payment_method, `Visit payment - ${normalizedVisitDate}`]
       );
       await client.query(
-        `INSERT INTO daily_ledger (entry_date, entry_type, category, description, amount, payment_method, patient_id, visit_id)
-         VALUES ($1,'income','therapy_fee',$2,$3,$4,$5,$6)`,
-        [normalizedVisitDate, `Therapy fee - ${visit.therapy_type || 'Session'}`, amount_paid, payment_method, patient_id, visit.id]
+        `INSERT INTO daily_ledger (clinic_id, entry_date, entry_type, category, description, amount, payment_method, patient_id, visit_id)
+         VALUES ($1,$2,'income','therapy_fee',$3,$4,$5,$6,$7)`,
+        [req.clinicId || null, normalizedVisitDate, `Therapy fee - ${visit.therapy_type || 'Session'}`, amount_paid, payment_method, patient_id, visit.id]
       );
     }
     await client.query('COMMIT');
@@ -290,11 +645,18 @@ app.put('/api/visits/:id', async (req, res) => {
             amount_paid, payment_method, payment_status, session_notes, chief_complaint, treatment_given } = req.body;
     const normalizedVisitDate = normalizeDate(visit_date);
     const result = await pool.query(
-      `UPDATE visits SET visit_date=$1, visit_time=$2, therapist_name=$3, therapy_type=$4, duration_minutes=$5,
-       fee_charged=$6, amount_paid=$7, payment_method=$8, payment_status=$9, session_notes=$10,
-       chief_complaint=$11, treatment_given=$12 WHERE id=$13 RETURNING *`,
-      [normalizedVisitDate, visit_time, therapist_name, therapy_type, duration_minutes || 60, fee_charged || 0,
-       amount_paid || 0, payment_method, payment_status, session_notes, chief_complaint, treatment_given, req.params.id]
+      req.clinicId
+        ? `UPDATE visits SET visit_date=$1, visit_time=$2, therapist_name=$3, therapy_type=$4, duration_minutes=$5,
+           fee_charged=$6, amount_paid=$7, payment_method=$8, payment_status=$9, session_notes=$10,
+           chief_complaint=$11, treatment_given=$12 WHERE id=$13 AND clinic_id=$14 RETURNING *`
+        : `UPDATE visits SET visit_date=$1, visit_time=$2, therapist_name=$3, therapy_type=$4, duration_minutes=$5,
+           fee_charged=$6, amount_paid=$7, payment_method=$8, payment_status=$9, session_notes=$10,
+           chief_complaint=$11, treatment_given=$12 WHERE id=$13 RETURNING *`,
+      req.clinicId
+        ? [normalizedVisitDate, visit_time, therapist_name, therapy_type, duration_minutes || 60, fee_charged || 0,
+           amount_paid || 0, payment_method, payment_status, session_notes, chief_complaint, treatment_given, req.params.id, req.clinicId]
+        : [normalizedVisitDate, visit_time, therapist_name, therapy_type, duration_minutes || 60, fee_charged || 0,
+           amount_paid || 0, payment_method, payment_status, session_notes, chief_complaint, treatment_given, req.params.id]
     );
     res.json(result.rows[0]);
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -303,7 +665,10 @@ app.put('/api/visits/:id', async (req, res) => {
 // ---- THERAPY PLANS ----
 app.get('/api/therapy-plans/:patient_id', async (req, res) => {
   try {
-    const result = await pool.query('SELECT * FROM therapy_plans WHERE patient_id=$1 ORDER BY created_at DESC', [req.params.patient_id]);
+    const result = await pool.query(
+      req.clinicId ? 'SELECT * FROM therapy_plans WHERE patient_id=$1 AND clinic_id=$2 ORDER BY created_at DESC' : 'SELECT * FROM therapy_plans WHERE patient_id=$1 ORDER BY created_at DESC',
+      req.clinicId ? [req.params.patient_id, req.clinicId] : [req.params.patient_id]
+    );
     res.json(result.rows);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -312,9 +677,9 @@ app.post('/api/therapy-plans', async (req, res) => {
   try {
     const { patient_id, plan_name, total_sessions, fee_per_session, start_date, end_date, notes } = req.body;
     const result = await pool.query(
-      `INSERT INTO therapy_plans (patient_id, plan_name, total_sessions, fee_per_session, start_date, end_date, notes)
-       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
-      [patient_id, plan_name, total_sessions, fee_per_session, start_date, end_date, notes]
+      `INSERT INTO therapy_plans (clinic_id, patient_id, plan_name, total_sessions, fee_per_session, start_date, end_date, notes)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+      [req.clinicId || null, patient_id, plan_name, total_sessions, fee_per_session, start_date, end_date, notes]
     );
     res.status(201).json(result.rows[0]);
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -334,6 +699,7 @@ app.get('/api/ledger', async (req, res) => {
            LEFT JOIN visits v ON l.visit_id = v.id
            WHERE 1=1`;
     const params = [];
+    if (req.clinicId) { params.push(req.clinicId); query += ` AND l.clinic_id = $${params.length}`; }
     if (date) { params.push(date); query += ` AND l.entry_date = $${params.length}`; }
     if (date_from) { params.push(date_from); query += ` AND l.entry_date >= $${params.length}`; }
     if (date_to) { params.push(date_to); query += ` AND l.entry_date <= $${params.length}`; }
@@ -351,18 +717,18 @@ app.post('/api/ledger', async (req, res) => {
     const patientId = patient_id ? patient_id : null;
     // insert into daily ledger
     const result = await pool.query(
-      `INSERT INTO daily_ledger (entry_date, entry_type, category, description, amount, payment_method, reference_number, patient_id)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
-      [normalizedEntryDate, entry_type, category, description, amount, payment_method, reference_number, patientId]
+      `INSERT INTO daily_ledger (clinic_id, entry_date, entry_type, category, description, amount, payment_method, reference_number, patient_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+      [req.clinicId || null, normalizedEntryDate, entry_type, category, description, amount, payment_method, reference_number, patientId]
     );
 
     console.log(entry_type, patientId, amount);
     // If this is an income entry for a patient, also record a patient payment so patient ledger reflects it
     if (entry_type === 'income' && patientId && Number(amount) > 0) {
       await pool.query(
-        `INSERT INTO patient_payments (patient_id, visit_id, payment_date, amount, payment_method, reference_number, notes)
-         VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-        [patientId, null, normalizedEntryDate, amount, payment_method, reference_number, description]
+        `INSERT INTO patient_payments (clinic_id, patient_id, visit_id, payment_date, amount, payment_method, reference_number, notes)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+        [req.clinicId || null, patientId, null, normalizedEntryDate, amount, payment_method, reference_number, description]
       );
     }
 
@@ -372,7 +738,7 @@ app.post('/api/ledger', async (req, res) => {
 
 app.delete('/api/ledger/:id', async (req, res) => {
   try {
-    await pool.query('DELETE FROM daily_ledger WHERE id=$1', [req.params.id]);
+    await pool.query(req.clinicId ? 'DELETE FROM daily_ledger WHERE id=$1 AND clinic_id=$2' : 'DELETE FROM daily_ledger WHERE id=$1', req.clinicId ? [req.params.id, req.clinicId] : [req.params.id]);
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -381,35 +747,60 @@ app.delete('/api/ledger/:id', async (req, res) => {
 app.get('/api/patient-ledger/:patient_id', async (req, res) => {
   try {
     const visits = await pool.query(
-      `SELECT v.id, v.patient_id, v.therapy_plan_id, to_char(v.visit_date,'YYYY-MM-DD') AS visit_date,
+      req.clinicId
+        ? `SELECT v.id, v.patient_id, v.therapy_plan_id, to_char(v.visit_date,'YYYY-MM-DD') AS visit_date,
               v.visit_time, v.therapist_name, v.therapy_type, v.duration_minutes,
               v.fee_charged, v.amount_paid, v.payment_method, v.payment_status,
               v.session_notes, v.chief_complaint, v.treatment_given, v.created_at,
               'visit' as record_type
-       FROM visits v
-       WHERE v.patient_id = $1
-       ORDER BY v.visit_date DESC`,
-      [req.params.patient_id]
+         FROM visits v
+         WHERE v.patient_id = $1 AND v.clinic_id = $2
+         ORDER BY v.visit_date DESC`
+        : `SELECT v.id, v.patient_id, v.therapy_plan_id, to_char(v.visit_date,'YYYY-MM-DD') AS visit_date,
+              v.visit_time, v.therapist_name, v.therapy_type, v.duration_minutes,
+              v.fee_charged, v.amount_paid, v.payment_method, v.payment_status,
+              v.session_notes, v.chief_complaint, v.treatment_given, v.created_at,
+              'visit' as record_type
+         FROM visits v
+         WHERE v.patient_id = $1
+         ORDER BY v.visit_date DESC`,
+      req.clinicId ? [req.params.patient_id, req.clinicId] : [req.params.patient_id]
     );
     const payments = await pool.query(
-      `SELECT pp.id, pp.visit_id, to_char(pp.payment_date,'YYYY-MM-DD') AS payment_date, pp.amount, pp.payment_method, pp.reference_number, pp.notes, pp.created_at, 'payment' as record_type FROM patient_payments pp WHERE pp.patient_id = $1 ORDER BY pp.payment_date DESC`,
-      [req.params.patient_id]
+      req.clinicId
+        ? `SELECT pp.id, pp.visit_id, to_char(pp.payment_date,'YYYY-MM-DD') AS payment_date, pp.amount, pp.payment_method, pp.reference_number, pp.notes, pp.created_at, 'payment' as record_type FROM patient_payments pp WHERE pp.patient_id = $1 AND pp.clinic_id = $2 ORDER BY pp.payment_date DESC`
+        : `SELECT pp.id, pp.visit_id, to_char(pp.payment_date,'YYYY-MM-DD') AS payment_date, pp.amount, pp.payment_method, pp.reference_number, pp.notes, pp.created_at, 'payment' as record_type FROM patient_payments pp WHERE pp.patient_id = $1 ORDER BY pp.payment_date DESC`,
+      req.clinicId ? [req.params.patient_id, req.clinicId] : [req.params.patient_id]
     );
     const summary = await pool.query(
-      `WITH visits_sum AS (
-         SELECT COALESCE(SUM(fee_charged),0) AS total_charged,
-                COUNT(*) AS total_visits
-         FROM visits WHERE patient_id = $1
-       ), payments_sum AS (
-         SELECT COALESCE(SUM(amount),0) AS total_paid
-         FROM patient_payments WHERE patient_id = $1
-       )
-       SELECT v.total_charged,
-              p.total_paid,
-              v.total_charged - p.total_paid AS balance_due,
-              v.total_visits
-       FROM visits_sum v CROSS JOIN payments_sum p`,
-      [req.params.patient_id]
+      req.clinicId
+        ? `WITH visits_sum AS (
+           SELECT COALESCE(SUM(fee_charged),0) AS total_charged,
+                  COUNT(*) AS total_visits
+           FROM visits WHERE patient_id = $1 AND clinic_id = $2
+         ), payments_sum AS (
+           SELECT COALESCE(SUM(amount),0) AS total_paid
+           FROM patient_payments WHERE patient_id = $1 AND clinic_id = $2
+         )
+         SELECT v.total_charged,
+                p.total_paid,
+                v.total_charged - p.total_paid AS balance_due,
+                v.total_visits
+         FROM visits_sum v CROSS JOIN payments_sum p`
+        : `WITH visits_sum AS (
+           SELECT COALESCE(SUM(fee_charged),0) AS total_charged,
+                  COUNT(*) AS total_visits
+           FROM visits WHERE patient_id = $1
+         ), payments_sum AS (
+           SELECT COALESCE(SUM(amount),0) AS total_paid
+           FROM patient_payments WHERE patient_id = $1
+         )
+         SELECT v.total_charged,
+                p.total_paid,
+                v.total_charged - p.total_paid AS balance_due,
+                v.total_visits
+         FROM visits_sum v CROSS JOIN payments_sum p`,
+      req.clinicId ? [req.params.patient_id, req.clinicId] : [req.params.patient_id]
     );
     // console.log(visits, payments, summary);
     res.json({ visits: visits.rows, payments: payments.rows, summary: summary.rows[0] });
@@ -421,7 +812,13 @@ app.get('/api/patient-dues', async (req, res) => {
   try {
     const { patient_id } = req.query;
     const params = [];
-    let query = `
+    const clinicFilter = req.clinicId ? ' AND clinic_id = $1' : '';
+    const patientFilter = patient_id ? ` AND p.id = $${req.clinicId ? 2 : 1}` : '';
+
+    if (req.clinicId) params.push(req.clinicId);
+    if (patient_id) params.push(patient_id);
+
+    const query = `
       SELECT p.id, p.patient_id as patient_code, p.first_name, p.last_name,
              COALESCE(v.total_charged,0) as total_charged,
              COALESCE(pay.total_paid,0) as total_paid,
@@ -430,23 +827,22 @@ app.get('/api/patient-dues', async (req, res) => {
       LEFT JOIN (
         SELECT patient_id, SUM(fee_charged) AS total_charged
         FROM visits
+        WHERE 1=1${clinicFilter}
         GROUP BY patient_id
       ) v ON v.patient_id = p.id
       LEFT JOIN (
         SELECT patient_id, SUM(amount) AS total_paid
         FROM patient_payments
+        WHERE 1=1${clinicFilter}
         GROUP BY patient_id
       ) pay ON pay.patient_id = p.id
+      WHERE 1=1
+      ${req.clinicId ? 'AND p.clinic_id = $1' : ''}
+      ${patientFilter}
+      ${!patient_id ? 'AND COALESCE(v.total_charged,0) - COALESCE(pay.total_paid,0) > 0' : ''}
+      ORDER BY due_balance DESC
     `;
-    if (patient_id) {
-      params.push(patient_id);
-      query += ` WHERE p.id = $${params.length}`;
-    }
-    if (!patient_id) {
-      query += ` WHERE COALESCE(v.total_charged,0) - COALESCE(pay.total_paid,0) > 0`;
-    }
-    query += ` ORDER BY due_balance DESC`;
-    // console.log(query, params);
+
     const result = await pool.query(query, params);
     res.json(result.rows);
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -456,23 +852,32 @@ app.get('/api/patient-dues', async (req, res) => {
 app.get('/api/dashboard', async (req, res) => {
   try {
     const today = new Date().toISOString().split('T')[0];
+    const clinicFilter = req.clinicId ? ` AND clinic_id = $${1}` : '';
     const [todayVisits, todayIncome, totalPatients, monthlyIncome, pendingBalance, recentVisits] = await Promise.all([
-      pool.query(`SELECT COUNT(*) FROM visits WHERE visit_date = $1`, [today]),
-      pool.query(`SELECT COALESCE(SUM(amount_paid),0) as total FROM visits WHERE visit_date = $1`, [today]),
-      pool.query(`SELECT COUNT(*) FROM patients WHERE is_active = true`),
-      pool.query(`SELECT COALESCE(SUM(amount),0) as total FROM daily_ledger WHERE entry_type='income' AND DATE_TRUNC('month', entry_date) = DATE_TRUNC('month', NOW())`),
-      pool.query(`SELECT (SELECT COALESCE(SUM(fee_charged),0) FROM visits) - (SELECT COALESCE(SUM(amount),0) FROM patient_payments) as total`),
-      pool.query(`SELECT v.*, p.first_name, p.last_name, p.patient_id as pid FROM visits v 
-                  JOIN patients p ON v.patient_id = p.id ORDER BY v.created_at DESC LIMIT 5`),
+      pool.query(req.clinicId ? `SELECT COUNT(*) FROM visits WHERE visit_date = $1 AND clinic_id = $2` : `SELECT COUNT(*) FROM visits WHERE visit_date = $1`, [today, ...(req.clinicId ? [req.clinicId] : [])]),
+      pool.query(req.clinicId ? `SELECT COALESCE(SUM(amount_paid),0) as total FROM visits WHERE visit_date = $1 AND clinic_id = $2` : `SELECT COALESCE(SUM(amount_paid),0) as total FROM visits WHERE visit_date = $1`, [today, ...(req.clinicId ? [req.clinicId] : [])]),
+      pool.query(req.clinicId ? `SELECT COUNT(*) FROM patients WHERE is_active = true AND clinic_id = $1` : `SELECT COUNT(*) FROM patients WHERE is_active = true`, [ ...(req.clinicId ? [req.clinicId] : []) ]),
+      pool.query(req.clinicId ? `SELECT COALESCE(SUM(amount),0) as total FROM daily_ledger WHERE entry_type='income' AND clinic_id = $1 AND DATE_TRUNC('month', entry_date) = DATE_TRUNC('month', NOW())` : `SELECT COALESCE(SUM(amount),0) as total FROM daily_ledger WHERE entry_type='income' AND DATE_TRUNC('month', entry_date) = DATE_TRUNC('month', NOW())`, [ ...(req.clinicId ? [req.clinicId] : []) ]),
+      pool.query(req.clinicId ? `SELECT (SELECT COALESCE(SUM(fee_charged),0) FROM visits WHERE clinic_id = $1) - (SELECT COALESCE(SUM(amount),0) FROM patient_payments WHERE clinic_id = $1) as total` : `SELECT (SELECT COALESCE(SUM(fee_charged),0) FROM visits) - (SELECT COALESCE(SUM(amount),0) FROM patient_payments) as total`, [ ...(req.clinicId ? [req.clinicId] : []) ]),
+      pool.query(req.clinicId ? `SELECT v.*, p.first_name, p.last_name, p.patient_id as pid FROM visits v 
+                  JOIN patients p ON v.patient_id = p.id WHERE v.clinic_id = $1 ORDER BY v.created_at DESC LIMIT 5` : `SELECT v.*, p.first_name, p.last_name, p.patient_id as pid FROM visits v 
+                  JOIN patients p ON v.patient_id = p.id ORDER BY v.created_at DESC LIMIT 5`, [ ...(req.clinicId ? [req.clinicId] : []) ]),
     ]);
-    const weeklyData = await pool.query(`
+    const weeklyData = await pool.query(req.clinicId ? `
+      SELECT TO_CHAR(gs.day, 'Dy') as day, 
+             COALESCE(SUM(v.amount_paid),0) as income,
+             COUNT(v.id) as visits
+      FROM generate_series(NOW()::date - 6, NOW()::date, '1 day'::interval) gs(day)
+      LEFT JOIN visits v ON v.visit_date = gs.day::date AND v.clinic_id = $1
+      GROUP BY gs.day ORDER BY gs.day
+    ` : `
       SELECT TO_CHAR(gs.day, 'Dy') as day, 
              COALESCE(SUM(v.amount_paid),0) as income,
              COUNT(v.id) as visits
       FROM generate_series(NOW()::date - 6, NOW()::date, '1 day'::interval) gs(day)
       LEFT JOIN visits v ON v.visit_date = gs.day::date
       GROUP BY gs.day ORDER BY gs.day
-    `);
+    `, [ ...(req.clinicId ? [req.clinicId] : []) ]);
     res.json({
       today_visits: parseInt(todayVisits.rows[0].count),
       today_income: parseFloat(todayIncome.rows[0].total),
@@ -506,11 +911,16 @@ app.get('/api/appointments', async (req, res) => {
              p.first_name, p.last_name, p.patient_id as patient_code
       FROM appointments a
       LEFT JOIN patients p ON a.patient_id = p.id
+      WHERE 1=1
     `;
     const params = [];
+    if (req.clinicId) {
+      params.push(req.clinicId);
+      query += ` AND a.clinic_id = $${params.length}`;
+    }
     if (start_date && end_date) {
       params.push(start_date, end_date);
-      query += ` WHERE a.appointment_date BETWEEN $1 AND $2`;
+      query += ` AND a.appointment_date BETWEEN $${params.length - 1} AND $${params.length}`;
     }
     query += ` ORDER BY a.appointment_date, a.appointment_time`;
     const result = await pool.query(query, params);
@@ -523,9 +933,9 @@ app.post('/api/appointments', async (req, res) => {
     const { patient_id, therapist_name, appointment_date, appointment_time, duration_minutes, therapy_type, status, notes } = req.body;
     const normalizedDate = normalizeDate(appointment_date);
     const result = await pool.query(
-      `INSERT INTO appointments (patient_id, therapist_name, appointment_date, appointment_time, duration_minutes, therapy_type, status, notes)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
-      [patient_id || null, therapist_name || '', normalizedDate, appointment_time, duration_minutes || 15, therapy_type || '', status || 'scheduled', notes || '']
+      `INSERT INTO appointments (clinic_id, patient_id, therapist_name, appointment_date, appointment_time, duration_minutes, therapy_type, status, notes)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+      [req.clinicId || null, patient_id || null, therapist_name || '', normalizedDate, appointment_time, duration_minutes || 15, therapy_type || '', status || 'scheduled', notes || '']
     );
     res.status(201).json(result.rows[0]);
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -536,10 +946,16 @@ app.put('/api/appointments/:id', async (req, res) => {
     const { patient_id, therapist_name, appointment_date, appointment_time, duration_minutes, therapy_type, status, notes } = req.body;
     const normalizedDate = normalizeDate(appointment_date);
     const result = await pool.query(
-      `UPDATE appointments SET patient_id=$1, therapist_name=$2, appointment_date=$3, appointment_time=$4, 
+      req.clinicId
+        ? `UPDATE appointments SET patient_id=$1, therapist_name=$2, appointment_date=$3, appointment_time=$4, 
               duration_minutes=$5, therapy_type=$6, status=$7, notes=$8, updated_at=NOW()
-       WHERE id=$9 RETURNING *`,
-      [patient_id || null, therapist_name || '', normalizedDate, appointment_time, duration_minutes || 15, therapy_type || '', status || 'scheduled', notes || '', req.params.id]
+           WHERE id=$9 AND clinic_id=$10 RETURNING *`
+        : `UPDATE appointments SET patient_id=$1, therapist_name=$2, appointment_date=$3, appointment_time=$4, 
+              duration_minutes=$5, therapy_type=$6, status=$7, notes=$8, updated_at=NOW()
+           WHERE id=$9 RETURNING *`,
+      req.clinicId
+        ? [patient_id || null, therapist_name || '', normalizedDate, appointment_time, duration_minutes || 15, therapy_type || '', status || 'scheduled', notes || '', req.params.id, req.clinicId]
+        : [patient_id || null, therapist_name || '', normalizedDate, appointment_time, duration_minutes || 15, therapy_type || '', status || 'scheduled', notes || '', req.params.id]
     );
     res.json(result.rows[0]);
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -547,14 +963,37 @@ app.put('/api/appointments/:id', async (req, res) => {
 
 app.delete('/api/appointments/:id', async (req, res) => {
   try {
-    await pool.query('DELETE FROM appointments WHERE id=$1', [req.params.id]);
+    await pool.query(req.clinicId ? 'DELETE FROM appointments WHERE id=$1 AND clinic_id=$2' : 'DELETE FROM appointments WHERE id=$1', req.clinicId ? [req.params.id, req.clinicId] : [req.params.id]);
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-const PORT = process.env.SERVER_PORT || 5000;
-
+const DEFAULT_PORT = Number(process.env.SERVER_PORT || process.env.PORT || 5000);
 
 // CRITICAL: Export the app for Vercel, do not call app.listen() when running on Vercel
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+const startServer = (port = DEFAULT_PORT) => {
+  const server = app.listen(port, () => console.log(`Server running on port ${port}`));
+
+  server.on('error', (err) => {
+    if (err.code === 'EADDRINUSE' && port === DEFAULT_PORT) {
+      const fallbackPort = port + 1;
+      console.warn(`Port ${port} is already in use. Trying ${fallbackPort} instead.`);
+      server.close(() => startServer(fallbackPort));
+    } else if (err.code === 'EADDRINUSE') {
+      const nextPort = port + 1;
+      console.warn(`Port ${port} is already in use. Trying ${nextPort} instead.`);
+      server.close(() => startServer(nextPort));
+    } else {
+      console.error('Server startup error:', err);
+      process.exit(1);
+    }
+  });
+
+  return server;
+};
+
+if (process.env.NODE_ENV !== 'test') {
+  startServer();
+}
+
 module.exports = app; 
