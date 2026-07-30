@@ -438,6 +438,7 @@ app.post('/api/admin/validate', async (req, res) => {
       return res.status(401).json({ success: false, error: 'Invalid admin password.' });
     }
     const adminToken = jwt.sign({ role: 'admin' }, ADMIN_JWT_SECRET, { expiresIn: '8h' });
+    console.log('admin validate: generated adminToken length=', adminToken ? adminToken.length : 0);
     res.json({ success: true, adminToken });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
