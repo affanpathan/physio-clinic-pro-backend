@@ -182,6 +182,17 @@ async function initDB() {
       updated_at TIMESTAMP DEFAULT NOW()
     );
 
+    CREATE TABLE IF NOT EXISTS therapists (
+      id SERIAL PRIMARY KEY,
+      clinic_id INTEGER REFERENCES clinic_master(id) ON DELETE CASCADE,
+      therapist_name VARCHAR(200) NOT NULL,
+      phone VARCHAR(30),
+      address TEXT,
+      active BOOLEAN DEFAULT TRUE,
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+
     CREATE TABLE IF NOT EXISTS clinic_master (
       id SERIAL PRIMARY KEY,
       clinic_name VARCHAR(200) NOT NULL,
@@ -211,11 +222,14 @@ async function initDB() {
     ALTER TABLE patients ADD COLUMN IF NOT EXISTS clinic_id INTEGER REFERENCES clinic_master(id) ON DELETE CASCADE;
     ALTER TABLE therapy_plans ADD COLUMN IF NOT EXISTS clinic_id INTEGER REFERENCES clinic_master(id) ON DELETE CASCADE;
     ALTER TABLE visits ADD COLUMN IF NOT EXISTS clinic_id INTEGER REFERENCES clinic_master(id) ON DELETE CASCADE;
+    ALTER TABLE visits ADD COLUMN IF NOT EXISTS therapy_types TEXT[];
     ALTER TABLE patient_payments ADD COLUMN IF NOT EXISTS clinic_id INTEGER REFERENCES clinic_master(id) ON DELETE CASCADE;
     ALTER TABLE daily_ledger ADD COLUMN IF NOT EXISTS clinic_id INTEGER REFERENCES clinic_master(id) ON DELETE CASCADE;
     ALTER TABLE appointments ADD COLUMN IF NOT EXISTS clinic_id INTEGER REFERENCES clinic_master(id) ON DELETE CASCADE;
+    ALTER TABLE therapists ADD COLUMN IF NOT EXISTS clinic_id INTEGER REFERENCES clinic_master(id) ON DELETE CASCADE;
 
     CREATE INDEX IF NOT EXISTS idx_visits_patient ON visits(patient_id);
+    CREATE INDEX IF NOT EXISTS idx_therapists_clinic ON therapists(clinic_id);
     CREATE INDEX IF NOT EXISTS idx_visits_date ON visits(visit_date);
     CREATE INDEX IF NOT EXISTS idx_ledger_date ON daily_ledger(entry_date);
     CREATE INDEX IF NOT EXISTS idx_patients_clinic ON patients(clinic_id);
@@ -501,6 +515,76 @@ app.delete('/api/clinic-users/:id', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ---- THERAPISTS ----
+app.get('/api/therapists', async (req, res) => {
+  try {
+    const query = req.clinicId
+      ? `SELECT t.*, cm.clinic_name FROM therapists t LEFT JOIN clinic_master cm ON t.clinic_id = cm.id WHERE t.clinic_id = $1 ORDER BY t.id ASC`
+      : `SELECT t.*, cm.clinic_name FROM therapists t LEFT JOIN clinic_master cm ON t.clinic_id = cm.id ORDER BY t.id ASC`;
+    const params = req.clinicId ? [req.clinicId] : [];
+    const result = await pool.query(query, params);
+    res.json(result.rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/therapists/:id', async (req, res) => {
+  try {
+    const query = req.clinicId
+      ? `SELECT t.*, cm.clinic_name FROM therapists t LEFT JOIN clinic_master cm ON t.clinic_id = cm.id WHERE t.id = $1 AND t.clinic_id = $2`
+      : `SELECT t.*, cm.clinic_name FROM therapists t LEFT JOIN clinic_master cm ON t.clinic_id = cm.id WHERE t.id = $1`;
+    const params = req.clinicId ? [req.params.id, req.clinicId] : [req.params.id];
+    const result = await pool.query(query, params);
+    if (!result.rows.length) return res.status(404).json({ error: 'Not found' });
+    res.json(result.rows[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/therapists', async (req, res) => {
+  try {
+    const { clinic_id, therapist_name, phone, address, active } = req.body;
+    if (!therapist_name || !therapist_name.trim()) {
+      return res.status(400).json({ error: 'Therapist name is required.' });
+    }
+    const targetClinicId = clinic_id || req.clinicId || null;
+    const result = await pool.query(
+      `INSERT INTO therapists (clinic_id, therapist_name, phone, address, active)
+       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+      [targetClinicId, therapist_name.trim(), phone || '', address || '', active !== undefined ? active : true]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.put('/api/therapists/:id', async (req, res) => {
+  try {
+    const { clinic_id, therapist_name, phone, address, active } = req.body;
+    if (!therapist_name || !therapist_name.trim()) {
+      return res.status(400).json({ error: 'Therapist name is required.' });
+    }
+    const targetClinicId = clinic_id || req.clinicId || null;
+    const clinicFilter = req.clinicId && !req.isAdmin ? ' AND clinic_id = $7' : '';
+    const query = req.clinicId && !req.isAdmin
+      ? `UPDATE therapists SET clinic_id = $1, therapist_name = $2, phone = $3, address = $4, active = $5, updated_at = NOW() WHERE id = $6${clinicFilter} RETURNING *`
+      : `UPDATE therapists SET clinic_id = $1, therapist_name = $2, phone = $3, address = $4, active = $5, updated_at = NOW() WHERE id = $6 RETURNING *`;
+    const params = req.clinicId && !req.isAdmin
+      ? [targetClinicId, therapist_name.trim(), phone || '', address || '', active !== undefined ? active : true, req.params.id, req.clinicId]
+      : [targetClinicId, therapist_name.trim(), phone || '', address || '', active !== undefined ? active : true, req.params.id];
+    const result = await pool.query(query, params);
+    if (!result.rows.length) return res.status(404).json({ error: 'Not found' });
+    res.json(result.rows[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete('/api/therapists/:id', async (req, res) => {
+  try {
+    const query = req.clinicId ? 'DELETE FROM therapists WHERE id = $1 AND clinic_id = $2 RETURNING id' : 'DELETE FROM therapists WHERE id = $1 RETURNING id';
+    const params = req.clinicId ? [req.params.id, req.clinicId] : [req.params.id];
+    const result = await pool.query(query, params);
+    if (!result.rows.length) return res.status(404).json({ error: 'Not found' });
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // ---- PATIENTS ----
 app.get('/api/patients', async (req, res) => {
   try {
@@ -595,17 +679,26 @@ app.post('/api/visits', async (req, res) => {
   try {
     // console.log('Request Body:', req.body);
     await client.query('BEGIN');
-    const { patient_id, therapy_plan_id, visit_date, visit_time, therapist_name, therapy_type,
+    const { patient_id, therapy_plan_id, visit_date, visit_time, therapist_name, therapy_type, therapy_types,
             duration_minutes, fee_charged, amount_paid, payment_method, payment_status, session_notes,
             chief_complaint, treatment_given } = req.body;
     const normalizedVisitDate = normalizeDate(visit_date);
+    // Normalize therapy_types: accept array, comma-separated string, or single therapy_type
+    let normalizedTherapyTypes = null;
+    if (Array.isArray(therapy_types)) {
+      normalizedTherapyTypes = therapy_types.map(t => String(t).trim()).filter(Boolean);
+    } else if (typeof therapy_types === 'string' && therapy_types.trim()) {
+      normalizedTherapyTypes = therapy_types.split(',').map(t => t.trim()).filter(Boolean);
+    } else if (therapy_type && String(therapy_type).trim()) {
+      normalizedTherapyTypes = [String(therapy_type).trim()];
+    }
     
     const visitResult = await client.query(
-      `INSERT INTO visits (clinic_id, patient_id, therapy_plan_id, visit_date, visit_time, therapist_name, therapy_type,
+      `INSERT INTO visits (clinic_id, patient_id, therapy_plan_id, visit_date, visit_time, therapist_name, therapy_type, therapy_types,
         duration_minutes, fee_charged, amount_paid, payment_method, payment_status, session_notes, chief_complaint, treatment_given)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING *`,
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING *`,
       [req.clinicId || null, patient_id, therapy_plan_id || null, normalizedVisitDate, visit_time, therapist_name, therapy_type,
-       duration_minutes || 60, fee_charged || 0, amount_paid || 0, payment_method, payment_status, session_notes, chief_complaint, treatment_given]
+       normalizedTherapyTypes, duration_minutes || 60, fee_charged || 0, amount_paid || 0, payment_method, payment_status, session_notes, chief_complaint, treatment_given]
     );
     const visit = visitResult.rows[0];
 
@@ -618,7 +711,7 @@ app.post('/api/visits', async (req, res) => {
       await client.query(
         `INSERT INTO daily_ledger (clinic_id, entry_date, entry_type, category, description, amount, payment_method, patient_id, visit_id)
          VALUES ($1,$2,'income','therapy_fee',$3,$4,$5,$6,$7)`,
-        [req.clinicId || null, normalizedVisitDate, `Therapy fee - ${visit.therapy_type || 'Session'}`, amount_paid, payment_method, patient_id, visit.id]
+        [req.clinicId || null, normalizedVisitDate, `Therapy fee - ${visit.therapy_type || (visit.therapy_types ? visit.therapy_types.join(', ') : 'Session')}`, amount_paid, payment_method, patient_id, visit.id]
       );
     }
     await client.query('COMMIT');
@@ -642,21 +735,28 @@ app.post('/api/visits', async (req, res) => {
 
 app.put('/api/visits/:id', async (req, res) => {
   try {
-    const { visit_date, visit_time, therapist_name, therapy_type, duration_minutes, fee_charged,
+    const { visit_date, visit_time, therapist_name, therapy_type, therapy_types, duration_minutes, fee_charged,
             amount_paid, payment_method, payment_status, session_notes, chief_complaint, treatment_given } = req.body;
     const normalizedVisitDate = normalizeDate(visit_date);
+    // Normalize therapy_types input
+    let normalizedTherapyTypes = null;
+    if (Array.isArray(therapy_types)) normalizedTherapyTypes = therapy_types.map(t => String(t).trim()).filter(Boolean);
+    else if (typeof therapy_types === 'string' && therapy_types.trim()) normalizedTherapyTypes = therapy_types.split(',').map(t => t.trim()).filter(Boolean);
+    else if (therapy_type && String(therapy_type).trim()) normalizedTherapyTypes = [String(therapy_type).trim()];
+    const finalTherapyType = (normalizedTherapyTypes && normalizedTherapyTypes.length > 0) ? normalizedTherapyTypes[0] : (therapy_type || null);
+
     const result = await pool.query(
       req.clinicId
-        ? `UPDATE visits SET visit_date=$1, visit_time=$2, therapist_name=$3, therapy_type=$4, duration_minutes=$5,
-           fee_charged=$6, amount_paid=$7, payment_method=$8, payment_status=$9, session_notes=$10,
-           chief_complaint=$11, treatment_given=$12 WHERE id=$13 AND clinic_id=$14 RETURNING *`
-        : `UPDATE visits SET visit_date=$1, visit_time=$2, therapist_name=$3, therapy_type=$4, duration_minutes=$5,
-           fee_charged=$6, amount_paid=$7, payment_method=$8, payment_status=$9, session_notes=$10,
-           chief_complaint=$11, treatment_given=$12 WHERE id=$13 RETURNING *`,
+        ? `UPDATE visits SET visit_date=$1, visit_time=$2, therapist_name=$3, therapy_type=$4, therapy_types=$5, duration_minutes=$6,
+           fee_charged=$7, amount_paid=$8, payment_method=$9, payment_status=$10, session_notes=$11,
+           chief_complaint=$12, treatment_given=$13 WHERE id=$14 AND clinic_id=$15 RETURNING *`
+        : `UPDATE visits SET visit_date=$1, visit_time=$2, therapist_name=$3, therapy_type=$4, therapy_types=$5, duration_minutes=$6,
+           fee_charged=$7, amount_paid=$8, payment_method=$9, payment_status=$10, session_notes=$11,
+           chief_complaint=$12, treatment_given=$13 WHERE id=$14 RETURNING *`,
       req.clinicId
-        ? [normalizedVisitDate, visit_time, therapist_name, therapy_type, duration_minutes || 60, fee_charged || 0,
+        ? [normalizedVisitDate, visit_time, therapist_name, finalTherapyType, normalizedTherapyTypes, duration_minutes || 60, fee_charged || 0,
            amount_paid || 0, payment_method, payment_status, session_notes, chief_complaint, treatment_given, req.params.id, req.clinicId]
-        : [normalizedVisitDate, visit_time, therapist_name, therapy_type, duration_minutes || 60, fee_charged || 0,
+        : [normalizedVisitDate, visit_time, therapist_name, finalTherapyType, normalizedTherapyTypes, duration_minutes || 60, fee_charged || 0,
            amount_paid || 0, payment_method, payment_status, session_notes, chief_complaint, treatment_given, req.params.id]
     );
     res.json(result.rows[0]);
