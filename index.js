@@ -202,6 +202,7 @@ async function initDB() {
       clinic_city VARCHAR(100),
       clinic_state VARCHAR(100),
       clinic_country VARCHAR(100),
+      currency VARCHAR(10) DEFAULT 'INR',
       last_date DATE,
       clinic_active BOOLEAN DEFAULT TRUE,
       created_at TIMESTAMP DEFAULT NOW(),
@@ -227,6 +228,7 @@ async function initDB() {
     ALTER TABLE daily_ledger ADD COLUMN IF NOT EXISTS clinic_id INTEGER REFERENCES clinic_master(id) ON DELETE CASCADE;
     ALTER TABLE appointments ADD COLUMN IF NOT EXISTS clinic_id INTEGER REFERENCES clinic_master(id) ON DELETE CASCADE;
     ALTER TABLE therapists ADD COLUMN IF NOT EXISTS clinic_id INTEGER REFERENCES clinic_master(id) ON DELETE CASCADE;
+    ALTER TABLE clinic_master ADD COLUMN IF NOT EXISTS currency VARCHAR(10) DEFAULT 'INR';
 
     CREATE INDEX IF NOT EXISTS idx_visits_patient ON visits(patient_id);
     CREATE INDEX IF NOT EXISTS idx_therapists_clinic ON therapists(clinic_id);
@@ -284,11 +286,11 @@ app.get('/api/clinic-master/:id', async (req, res) => {
 
 app.post('/api/clinic-master', async (req, res) => {
   try {
-    const { clinic_name, clinic_person, clinic_phone, clinic_address, clinic_city, clinic_state, clinic_country, last_date, clinic_active } = req.body;
+    const { clinic_name, clinic_person, clinic_phone, clinic_address, clinic_city, clinic_state, clinic_country, currency, last_date, clinic_active } = req.body;
     const result = await pool.query(
-      `INSERT INTO clinic_master (clinic_name, clinic_person, clinic_phone, clinic_address, clinic_city, clinic_state, clinic_country, last_date, clinic_active)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
-      [clinic_name, clinic_person || '', clinic_phone || '', clinic_address || '', clinic_city || '', clinic_state || '', clinic_country || '', last_date || null, clinic_active !== undefined ? clinic_active : true]
+      `INSERT INTO clinic_master (clinic_name, clinic_person, clinic_phone, clinic_address, clinic_city, clinic_state, clinic_country, currency, last_date, clinic_active)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
+      [clinic_name, clinic_person || '', clinic_phone || '', clinic_address || '', clinic_city || '', clinic_state || '', clinic_country || '', currency || 'INR', last_date || null, clinic_active !== undefined ? clinic_active : true]
     );
     res.status(201).json(result.rows[0]);
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -296,13 +298,13 @@ app.post('/api/clinic-master', async (req, res) => {
 
 app.put('/api/clinic-master/:id', async (req, res) => {
   try {
-    const { clinic_name, clinic_person, clinic_phone, clinic_address, clinic_city, clinic_state, clinic_country, last_date, clinic_active } = req.body;
+    const { clinic_name, clinic_person, clinic_phone, clinic_address, clinic_city, clinic_state, clinic_country, currency, last_date, clinic_active } = req.body;
     const result = await pool.query(
       `UPDATE clinic_master
        SET clinic_name = $1, clinic_person = $2, clinic_phone = $3, clinic_address = $4, clinic_city = $5,
-           clinic_state = $6, clinic_country = $7, last_date = $8, clinic_active = $9, updated_at = NOW()
-       WHERE id = $10 RETURNING *`,
-      [clinic_name, clinic_person || '', clinic_phone || '', clinic_address || '', clinic_city || '', clinic_state || '', clinic_country || '', last_date || null, clinic_active !== undefined ? clinic_active : true, req.params.id]
+           clinic_state = $6, clinic_country = $7, currency = $8, last_date = $9, clinic_active = $10, updated_at = NOW()
+       WHERE id = $11 RETURNING *`,
+      [clinic_name, clinic_person || '', clinic_phone || '', clinic_address || '', clinic_city || '', clinic_state || '', clinic_country || '', currency || 'INR', last_date || null, clinic_active !== undefined ? clinic_active : true, req.params.id]
     );
     if (!result.rows.length) return res.status(404).json({ error: 'Not found' });
     res.json(result.rows[0]);
