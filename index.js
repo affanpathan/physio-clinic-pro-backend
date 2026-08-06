@@ -744,6 +744,7 @@ app.post('/api/visits', async (req, res) => {
 });
 
 app.put('/api/visits/:id', async (req, res) => {
+  const client = await pool.connect();
   try {
     const { visit_date, visit_time, therapist_name, therapy_type, therapy_types, duration_minutes, fee_charged,
             amount_paid, payment_method, payment_status, session_notes, chief_complaint, treatment_given } = req.body;
@@ -754,8 +755,10 @@ app.put('/api/visits/:id', async (req, res) => {
     else if (typeof therapy_types === 'string' && therapy_types.trim()) normalizedTherapyTypes = therapy_types.split(',').map(t => t.trim()).filter(Boolean);
     else if (therapy_type && String(therapy_type).trim()) normalizedTherapyTypes = [String(therapy_type).trim()];
     const finalTherapyType = (normalizedTherapyTypes && normalizedTherapyTypes.length > 0) ? normalizedTherapyTypes[0] : (therapy_type || null);
+    const normalizedAmountPaid = amount_paid || 0;
 
-    const result = await pool.query(
+    await client.query('BEGIN');
+    const result = await client.query(
       req.clinicId
         ? `UPDATE visits SET visit_date=$1, visit_time=$2, therapist_name=$3, therapy_type=$4, therapy_types=$5, duration_minutes=$6,
            fee_charged=$7, amount_paid=$8, payment_method=$9, payment_status=$10, session_notes=$11,
@@ -765,12 +768,38 @@ app.put('/api/visits/:id', async (req, res) => {
            chief_complaint=$12, treatment_given=$13 WHERE id=$14 RETURNING *`,
       req.clinicId
         ? [normalizedVisitDate, visit_time, therapist_name, finalTherapyType, normalizedTherapyTypes, duration_minutes || 60, fee_charged || 0,
-           amount_paid || 0, payment_method, payment_status, session_notes, chief_complaint, treatment_given, req.params.id, req.clinicId]
+           normalizedAmountPaid, payment_method, payment_status, session_notes, chief_complaint, treatment_given, req.params.id, req.clinicId]
         : [normalizedVisitDate, visit_time, therapist_name, finalTherapyType, normalizedTherapyTypes, duration_minutes || 60, fee_charged || 0,
-           amount_paid || 0, payment_method, payment_status, session_notes, chief_complaint, treatment_given, req.params.id]
+           normalizedAmountPaid, payment_method, payment_status, session_notes, chief_complaint, treatment_given, req.params.id]
     );
-    res.json(result.rows[0]);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+    if (!result.rows.length) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Not found' });
+    }
+    const visit = result.rows[0];
+
+    // Re-sync patient_payments / daily_ledger with this visit's current payment,
+    // mirroring the fan-out done on create (see POST /api/visits).
+    await client.query('DELETE FROM patient_payments WHERE visit_id=$1', [visit.id]);
+    await client.query('DELETE FROM daily_ledger WHERE visit_id=$1', [visit.id]);
+    if (normalizedAmountPaid > 0) {
+      await client.query(
+        `INSERT INTO patient_payments (clinic_id, patient_id, visit_id, payment_date, amount, payment_method, notes)
+         VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+        [visit.clinic_id, visit.patient_id, visit.id, normalizedVisitDate, normalizedAmountPaid, payment_method, `Visit payment - ${normalizedVisitDate}`]
+      );
+      await client.query(
+        `INSERT INTO daily_ledger (clinic_id, entry_date, entry_type, category, description, amount, payment_method, patient_id, visit_id)
+         VALUES ($1,$2,'income','therapy_fee',$3,$4,$5,$6,$7)`,
+        [visit.clinic_id, normalizedVisitDate, `Therapy fee - ${visit.therapy_type || (visit.therapy_types ? visit.therapy_types.join(', ') : 'Session')}`, normalizedAmountPaid, payment_method, visit.patient_id, visit.id]
+      );
+    }
+    await client.query('COMMIT');
+    res.json(visit);
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: err.message });
+  } finally { client.release(); }
 });
 
 // ---- THERAPY PLANS ----
