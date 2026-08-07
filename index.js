@@ -2,7 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
-const { Pool } = require('pg');
+const { Pool, types } = require('pg');
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 
@@ -73,6 +73,11 @@ pool.on('error', (err) => {
   console.error('Unexpected error on idle PostgreSQL client:', err.message);
   // Do not exit the process; let Vercel handle recycling the serverless container
 });
+
+// DATE (OID 1082): return as raw 'YYYY-MM-DD' string. Without this, pg parses it into a
+// local-midnight JS Date, and res.json()'s toISOString() call then shifts it to the previous
+// calendar day whenever the server's local timezone is ahead of UTC.
+types.setTypeParser(1082, (val) => val);
 
 const normalizeDate = (value) => {
   if (!value) return null;
@@ -720,6 +725,7 @@ app.post('/api/visits', async (req, res) => {
     const { therapies: normalizedTherapies, error: therapiesError } = normalizeTherapies(therapies);
     if (therapiesError) return res.status(400).json({ error: therapiesError });
     if (!normalizedTherapies.length) return res.status(400).json({ error: 'At least one therapy type with duration is required.' });
+    if (!fee_charged || Number(fee_charged) <= 0) return res.status(400).json({ error: 'Fee charged is required.' });
 
     const normalizedVisitDate = normalizeDate(visit_date);
     const legacyTherapyType = normalizedTherapies[0].therapy_type;
@@ -775,12 +781,29 @@ app.put('/api/visits/:id', async (req, res) => {
     const { therapies: normalizedTherapies, error: therapiesError } = normalizeTherapies(therapies);
     if (therapiesError) return res.status(400).json({ error: therapiesError });
     if (!normalizedTherapies.length) return res.status(400).json({ error: 'At least one therapy type with duration is required.' });
+    if (!fee_charged || Number(fee_charged) <= 0) return res.status(400).json({ error: 'Fee charged is required.' });
 
     const normalizedVisitDate = normalizeDate(visit_date);
     const legacyTherapyType = normalizedTherapies[0].therapy_type;
     const totalDuration = normalizedTherapies.reduce((s, t) => s + t.duration_minutes, 0);
 
     await client.query('BEGIN');
+
+    const existing = await client.query(
+      req.clinicId
+        ? 'SELECT amount_paid, (visit_date = CURRENT_DATE) AS is_today FROM visits WHERE id=$1 AND clinic_id=$2'
+        : 'SELECT amount_paid, (visit_date = CURRENT_DATE) AS is_today FROM visits WHERE id=$1',
+      req.clinicId ? [req.params.id, req.clinicId] : [req.params.id]
+    );
+    if (!existing.rows.length) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Not found' });
+    }
+    if (!existing.rows[0].is_today && Number(amount_paid || 0) !== Number(existing.rows[0].amount_paid)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Paid amount can only be edited on the day of the visit.' });
+    }
+
     const result = await client.query(
       req.clinicId
         ? `UPDATE visits SET visit_date=$1, visit_time=$2, therapist_name=$3, therapy_type=$4, therapy_types=$5::jsonb, duration_minutes=$6,
