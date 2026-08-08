@@ -750,7 +750,7 @@ app.post('/api/visits', async (req, res) => {
       );
       await client.query(
         `INSERT INTO daily_ledger (clinic_id, entry_date, entry_type, category, description, amount, payment_method, patient_id, visit_id)
-         VALUES ($1,$2,'income','therapy_fee',$3,$4,$5,$6,$7)`,
+         VALUES ($1,$2,'income','Therapy Fee',$3,$4,$5,$6,$7)`,
         [req.clinicId || null, normalizedVisitDate, `Therapy fee - ${legacyTherapyType}`, amount_paid, payment_method, patient_id, visit.id]
       );
     }
@@ -836,7 +836,7 @@ app.put('/api/visits/:id', async (req, res) => {
       );
       await client.query(
         `INSERT INTO daily_ledger (clinic_id, entry_date, entry_type, category, description, amount, payment_method, patient_id, visit_id)
-         VALUES ($1,$2,'income','therapy_fee',$3,$4,$5,$6,$7)`,
+         VALUES ($1,$2,'income','Therapy Fee',$3,$4,$5,$6,$7)`,
         [req.clinicId || null, normalizedVisitDate, `Therapy fee - ${legacyTherapyType}`, amount_paid, payment_method, visit.patient_id, visit.id]
       );
     }
@@ -903,7 +903,7 @@ app.get('/api/ledger', async (req, res) => {
               to_char(l.entry_date,'YYYY-MM-DD') AS entry_date,
               l.entry_type, l.category, l.description, l.amount, l.payment_method, l.reference_number,
               l.patient_id, l.visit_id, l.created_at,
-              p.first_name, p.last_name, v.fee_charged, v.amount_paid
+              p.first_name, p.last_name, v.fee_charged, v.amount_paid, v.therapy_type, v.therapy_types
            FROM daily_ledger l
            LEFT JOIN patients p ON l.patient_id = p.id
            LEFT JOIN visits v ON l.visit_id = v.id
@@ -980,7 +980,7 @@ app.get('/api/patient-ledger/:patient_id', async (req, res) => {
     const visits = await pool.query(
       req.clinicId
         ? `SELECT v.id, v.patient_id, v.therapy_plan_id, to_char(v.visit_date,'YYYY-MM-DD') AS visit_date,
-              v.visit_time, v.therapist_name, v.therapy_type, v.duration_minutes,
+              v.visit_time, v.therapist_name, v.therapy_type, v.therapy_types, v.duration_minutes,
               v.fee_charged, v.amount_paid, v.payment_method, v.payment_status,
               v.session_notes, v.chief_complaint, v.treatment_given, v.created_at,
               'visit' as record_type
@@ -988,7 +988,7 @@ app.get('/api/patient-ledger/:patient_id', async (req, res) => {
          WHERE v.patient_id = $1 AND v.clinic_id = $2
          ORDER BY v.visit_date DESC`
         : `SELECT v.id, v.patient_id, v.therapy_plan_id, to_char(v.visit_date,'YYYY-MM-DD') AS visit_date,
-              v.visit_time, v.therapist_name, v.therapy_type, v.duration_minutes,
+              v.visit_time, v.therapist_name, v.therapy_type, v.therapy_types, v.duration_minutes,
               v.fee_charged, v.amount_paid, v.payment_method, v.payment_status,
               v.session_notes, v.chief_complaint, v.treatment_given, v.created_at,
               'visit' as record_type
