@@ -256,6 +256,7 @@ async function initDB() {
       END IF;
     END $$;
     ALTER TABLE patient_payments ADD COLUMN IF NOT EXISTS clinic_id INTEGER REFERENCES clinic_master(id) ON DELETE CASCADE;
+    ALTER TABLE patient_payments ADD COLUMN IF NOT EXISTS ledger_id INTEGER REFERENCES daily_ledger(id) ON DELETE SET NULL;
     ALTER TABLE daily_ledger ADD COLUMN IF NOT EXISTS clinic_id INTEGER REFERENCES clinic_master(id) ON DELETE CASCADE;
     ALTER TABLE appointments ADD COLUMN IF NOT EXISTS clinic_id INTEGER REFERENCES clinic_master(id) ON DELETE CASCADE;
     ALTER TABLE therapists ADD COLUMN IF NOT EXISTS clinic_id INTEGER REFERENCES clinic_master(id) ON DELETE CASCADE;
@@ -920,36 +921,57 @@ app.get('/api/ledger', async (req, res) => {
 });
 
 app.post('/api/ledger', async (req, res) => {
+  const client = await pool.connect();
   try {
     const { entry_date, entry_type, category, description, amount, payment_method, reference_number, patient_id } = req.body;
     const normalizedEntryDate = normalizeDate(entry_date);
     const patientId = patient_id ? patient_id : null;
+
+    await client.query('BEGIN');
+
     // insert into daily ledger
-    const result = await pool.query(
+    const result = await client.query(
       `INSERT INTO daily_ledger (clinic_id, entry_date, entry_type, category, description, amount, payment_method, reference_number, patient_id)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
       [req.clinicId || null, normalizedEntryDate, entry_type, category, description, amount, payment_method, reference_number, patientId]
     );
+    const ledgerEntry = result.rows[0];
 
-    console.log(entry_type, patientId, amount);
     // If this is an income entry for a patient, also record a patient payment so patient ledger reflects it
     if (entry_type === 'income' && patientId && Number(amount) > 0) {
-      await pool.query(
-        `INSERT INTO patient_payments (clinic_id, patient_id, visit_id, payment_date, amount, payment_method, reference_number, notes)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-        [req.clinicId || null, patientId, null, normalizedEntryDate, amount, payment_method, reference_number, description]
+      await client.query(
+        `INSERT INTO patient_payments (clinic_id, patient_id, visit_id, ledger_id, payment_date, amount, payment_method, reference_number, notes)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+        [req.clinicId || null, patientId, null, ledgerEntry.id, normalizedEntryDate, amount, payment_method, reference_number, description]
       );
     }
 
-    res.status(201).json(result.rows[0]);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+    await client.query('COMMIT');
+    res.status(201).json(ledgerEntry);
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: err.message });
+  } finally { client.release(); }
 });
 
 app.delete('/api/ledger/:id', async (req, res) => {
+  const client = await pool.connect();
   try {
-    await pool.query(req.clinicId ? 'DELETE FROM daily_ledger WHERE id=$1 AND clinic_id=$2' : 'DELETE FROM daily_ledger WHERE id=$1', req.clinicId ? [req.params.id, req.clinicId] : [req.params.id]);
+    await client.query('BEGIN');
+    await client.query(
+      req.clinicId ? 'DELETE FROM patient_payments WHERE ledger_id=$1 AND clinic_id=$2' : 'DELETE FROM patient_payments WHERE ledger_id=$1',
+      req.clinicId ? [req.params.id, req.clinicId] : [req.params.id]
+    );
+    await client.query(
+      req.clinicId ? 'DELETE FROM daily_ledger WHERE id=$1 AND clinic_id=$2' : 'DELETE FROM daily_ledger WHERE id=$1',
+      req.clinicId ? [req.params.id, req.clinicId] : [req.params.id]
+    );
+    await client.query('COMMIT');
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: err.message });
+  } finally { client.release(); }
 });
 
 // ---- PATIENT LEDGER ----
