@@ -242,6 +242,7 @@ async function initDB() {
     );
 
     ALTER TABLE patients ADD COLUMN IF NOT EXISTS clinic_id INTEGER REFERENCES clinic_master(id) ON DELETE CASCADE;
+    ALTER TABLE patients ADD COLUMN IF NOT EXISTS age INTEGER;
     ALTER TABLE therapy_plans ADD COLUMN IF NOT EXISTS clinic_id INTEGER REFERENCES clinic_master(id) ON DELETE CASCADE;
     ALTER TABLE visits ADD COLUMN IF NOT EXISTS clinic_id INTEGER REFERENCES clinic_master(id) ON DELETE CASCADE;
     ALTER TABLE visits ADD COLUMN IF NOT EXISTS therapy_types TEXT[];
@@ -663,13 +664,13 @@ app.get('/api/patients/:id', async (req, res) => {
 
 app.post('/api/patients', async (req, res) => {
   try {
-    const { first_name, last_name, phone, email, date_of_birth, gender, address, diagnosis, referring_doctor, notes } = req.body;
+    const { first_name, last_name, phone, email, date_of_birth, age, gender, address, diagnosis, referring_doctor, notes } = req.body;
     const countRes = await pool.query('SELECT COUNT(*) FROM patients');
     const patient_id = `PT${String(parseInt(countRes.rows[0].count) + 1001).padStart(5,'0')}`;
     const result = await pool.query(
-      `INSERT INTO patients (clinic_id, patient_id, first_name, last_name, phone, email, date_of_birth, gender, address, diagnosis, referring_doctor, notes)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`,
-      [req.clinicId || null, patient_id, first_name, last_name, phone, email, date_of_birth, gender, address, diagnosis, referring_doctor, notes]
+      `INSERT INTO patients (clinic_id, patient_id, first_name, last_name, phone, email, date_of_birth, age, gender, address, diagnosis, referring_doctor, notes)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
+      [req.clinicId || null, patient_id, first_name, last_name, phone, email, date_of_birth || null, age || null, gender, address, diagnosis, referring_doctor, notes]
     );
     res.status(201).json(result.rows[0]);
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -677,18 +678,18 @@ app.post('/api/patients', async (req, res) => {
 
 app.put('/api/patients/:id', async (req, res) => {
   try {
-    const { first_name, last_name, phone, email, date_of_birth, gender, address, diagnosis, referring_doctor, notes, is_active } = req.body;
+    const { first_name, last_name, phone, email, date_of_birth, age, gender, address, diagnosis, referring_doctor, notes, is_active } = req.body;
     const result = await pool.query(
       req.clinicId
-        ? `UPDATE patients SET first_name=$1, last_name=$2, phone=$3, email=$4, date_of_birth=$5, gender=$6,
-           address=$7, diagnosis=$8, referring_doctor=$9, notes=$10, is_active=$11, updated_at=NOW()
-           WHERE id=$12 AND clinic_id=$13 RETURNING *`
-        : `UPDATE patients SET first_name=$1, last_name=$2, phone=$3, email=$4, date_of_birth=$5, gender=$6,
-           address=$7, diagnosis=$8, referring_doctor=$9, notes=$10, is_active=$11, updated_at=NOW()
-           WHERE id=$12 RETURNING *`,
+        ? `UPDATE patients SET first_name=$1, last_name=$2, phone=$3, email=$4, date_of_birth=$5, age=$6, gender=$7,
+           address=$8, diagnosis=$9, referring_doctor=$10, notes=$11, is_active=$12, updated_at=NOW()
+           WHERE id=$13 AND clinic_id=$14 RETURNING *`
+        : `UPDATE patients SET first_name=$1, last_name=$2, phone=$3, email=$4, date_of_birth=$5, age=$6, gender=$7,
+           address=$8, diagnosis=$9, referring_doctor=$10, notes=$11, is_active=$12, updated_at=NOW()
+           WHERE id=$13 RETURNING *`,
       req.clinicId
-        ? [first_name, last_name, phone, email, date_of_birth, gender, address, diagnosis, referring_doctor, notes, is_active, req.params.id, req.clinicId]
-        : [first_name, last_name, phone, email, date_of_birth, gender, address, diagnosis, referring_doctor, notes, is_active, req.params.id]
+        ? [first_name, last_name, phone, email, date_of_birth || null, age || null, gender, address, diagnosis, referring_doctor, notes, is_active, req.params.id, req.clinicId]
+        : [first_name, last_name, phone, email, date_of_birth || null, age || null, gender, address, diagnosis, referring_doctor, notes, is_active, req.params.id]
     );
     res.json(result.rows[0]);
   } catch (err) { res.status(500).json({ error: err.message }); }
