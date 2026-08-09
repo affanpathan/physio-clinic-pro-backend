@@ -921,6 +921,75 @@ app.get('/api/ledger', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+const REPORTS_PAGE_SIZES = [25, 50, 75, 100];
+
+app.get('/api/reports', async (req, res) => {
+  try {
+    const { date_from, date_to, entry_type, therapist_name, patient_id, payment_method } = req.query;
+    if (!date_from || !date_to) {
+      return res.status(400).json({ error: 'date_from and date_to are required' });
+    }
+    let page = parseInt(req.query.page, 10);
+    if (!Number.isInteger(page) || page < 1) page = 1;
+    let pageSize = parseInt(req.query.pageSize, 10);
+    if (!REPORTS_PAGE_SIZES.includes(pageSize)) pageSize = 25;
+
+    const whereParams = [];
+    let where = ' WHERE 1=1';
+    if (req.clinicId) { whereParams.push(req.clinicId); where += ` AND l.clinic_id = $${whereParams.length}`; }
+    whereParams.push(date_from); where += ` AND l.entry_date >= $${whereParams.length}`;
+    whereParams.push(date_to); where += ` AND l.entry_date <= $${whereParams.length}`;
+    if (entry_type) { whereParams.push(entry_type); where += ` AND l.entry_type = $${whereParams.length}`; }
+    if (therapist_name) { whereParams.push(therapist_name); where += ` AND v.therapist_name = $${whereParams.length}`; }
+    if (patient_id) { whereParams.push(patient_id); where += ` AND l.patient_id = $${whereParams.length}`; }
+    if (payment_method) { whereParams.push(payment_method); where += ` AND l.payment_method = $${whereParams.length}`; }
+
+    const fromJoin = ` FROM daily_ledger l
+           LEFT JOIN patients p ON l.patient_id = p.id
+           LEFT JOIN visits v ON l.visit_id = v.id`;
+
+    const summaryResult = await pool.query(
+      `SELECT COUNT(*) AS total,
+              COALESCE(SUM(CASE WHEN l.entry_type = 'income' THEN l.amount ELSE 0 END), 0) AS total_income,
+              COALESCE(SUM(CASE WHEN l.entry_type = 'expense' THEN l.amount ELSE 0 END), 0) AS total_expense,
+              COALESCE(SUM(CASE WHEN l.payment_method = 'cash' THEN l.amount ELSE 0 END), 0) AS cash_amount,
+              COALESCE(SUM(CASE WHEN l.payment_method = 'online' THEN l.amount ELSE 0 END), 0) AS online_amount
+       ${fromJoin}${where}`,
+      whereParams
+    );
+    const summaryRow = summaryResult.rows[0];
+    const total = parseInt(summaryRow.total, 10);
+    const totalIncome = Number(summaryRow.total_income);
+    const totalExpense = Number(summaryRow.total_expense);
+
+    const dataParams = [...whereParams, pageSize, (page - 1) * pageSize];
+    const dataQuery = `SELECT l.id,
+              to_char(l.entry_date,'YYYY-MM-DD') AS entry_date,
+              l.entry_type, l.category, l.description, l.amount, l.payment_method, l.reference_number,
+              l.patient_id, l.visit_id, l.created_at,
+              p.first_name, p.last_name, v.therapist_name
+           ${fromJoin}${where}
+           ORDER BY l.entry_date DESC, l.created_at DESC
+           LIMIT $${dataParams.length - 1} OFFSET $${dataParams.length}`;
+    const result = await pool.query(dataQuery, dataParams);
+
+    res.json({
+      rows: result.rows,
+      total,
+      page,
+      pageSize,
+      totalPages: Math.max(1, Math.ceil(total / pageSize)),
+      summary: {
+        totalIncome,
+        totalExpense,
+        grandTotal: totalIncome - totalExpense,
+        cashAmount: Number(summaryRow.cash_amount),
+        onlineAmount: Number(summaryRow.online_amount),
+      },
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.post('/api/ledger', async (req, res) => {
   const client = await pool.connect();
   try {
