@@ -490,7 +490,7 @@ app.post('/api/clinic-users/login', async (req, res) => {
         clinicId: userRecord.clinic_id,
       },
       JWT_SECRET,
-      { expiresIn: '8h' }
+      { expiresIn: '12h' }
     );
 
     res.json({
@@ -530,7 +530,7 @@ app.post('/api/admin/validate', async (req, res) => {
     if (providedPassword !== sysAdminPassword) {
       return res.status(401).json({ success: false, error: 'Invalid admin password.' });
     }
-    const adminToken = jwt.sign({ role: 'admin' }, ADMIN_JWT_SECRET, { expiresIn: '8h' });
+    const adminToken = jwt.sign({ role: 'admin' }, ADMIN_JWT_SECRET, { expiresIn: '12h' });
     console.log('admin validate: generated adminToken length=', adminToken ? adminToken.length : 0);
     res.json({ success: true, adminToken });
   } catch (err) {
