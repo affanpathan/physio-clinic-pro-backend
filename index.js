@@ -102,6 +102,43 @@ function normalizeTherapies(therapies) {
   return { therapies: result, error: null };
 }
 
+// Balance the patient carries INTO a visit. Positive = dues outstanding, negative = advance credit.
+// excludeVisitId leaves the visit being saved/edited out of both sums so it never counts against itself.
+// `db` may be the pool or a transaction client.
+async function getPriorBalance(db, patientId, clinicId = null, excludeVisitId = null) {
+  const params = [patientId];
+  let clinicSql = '';
+  if (clinicId) { params.push(clinicId); clinicSql = ` AND clinic_id = $${params.length}`; }
+  let visitExcl = '', payExcl = '';
+  if (excludeVisitId) {
+    params.push(excludeVisitId);
+    visitExcl = ` AND id <> $${params.length}`;
+    payExcl = ` AND (visit_id IS NULL OR visit_id <> $${params.length})`;
+  }
+  const { rows } = await db.query(
+    `SELECT (SELECT COALESCE(SUM(fee_charged),0) FROM visits
+              WHERE patient_id = $1${clinicSql}${visitExcl})
+          - (SELECT COALESCE(SUM(amount),0) FROM patient_payments
+              WHERE patient_id = $1${clinicSql}${payExcl}) AS balance_due`,
+    params
+  );
+  const balance = Number(rows[0].balance_due || 0);
+  return {
+    balance_due: balance,
+    advance_credit: balance < 0 ? -balance : 0,
+    due_amount: balance > 0 ? balance : 0,
+  };
+}
+
+// An advance already on file marks the visit paid, even when it only partly covers the fee.
+function resolvePaymentStatus(fee, amountPaid, advanceCredit) {
+  const feeValue = Number(fee || 0), paidValue = Number(amountPaid || 0);
+  if (Number(advanceCredit || 0) > 0) return 'paid';
+  if (feeValue > 0 && paidValue >= feeValue) return 'paid';
+  if (paidValue > 0) return 'partial';
+  return 'pending';
+}
+
 // Initialize DB schema
 async function initDB() {
   await pool.query(`
@@ -720,8 +757,10 @@ app.post('/api/visits', async (req, res) => {
   const client = await pool.connect();
   try {
     // console.log('Request Body:', req.body);
+    // payment_status is intentionally not read from the body — it is derived below from the
+    // patient's carried-forward balance, which the client cannot see.
     const { patient_id, therapy_plan_id, visit_date, visit_time, therapist_name, therapies,
-            fee_charged, amount_paid, payment_method, payment_status, session_notes,
+            fee_charged, amount_paid, payment_method, session_notes,
             chief_complaint, treatment_given } = req.body;
 
     const { therapies: normalizedTherapies, error: therapiesError } = normalizeTherapies(therapies);
@@ -734,12 +773,17 @@ app.post('/api/visits', async (req, res) => {
     const totalDuration = normalizedTherapies.reduce((s, t) => s + t.duration_minutes, 0);
 
     await client.query('BEGIN');
+
+    // Advance paid on earlier visits carries forward and settles this one.
+    const prior = await getPriorBalance(client, patient_id, req.clinicId);
+    const resolvedStatus = resolvePaymentStatus(fee_charged, amount_paid, prior.advance_credit);
+
     const visitResult = await client.query(
       `INSERT INTO visits (clinic_id, patient_id, therapy_plan_id, visit_date, visit_time, therapist_name, therapy_type, therapy_types,
         duration_minutes, fee_charged, amount_paid, payment_method, payment_status, session_notes, chief_complaint, treatment_given)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING *`,
       [req.clinicId || null, patient_id, therapy_plan_id || null, normalizedVisitDate, visit_time, therapist_name, legacyTherapyType,
-       JSON.stringify(normalizedTherapies), totalDuration, fee_charged || 0, amount_paid || 0, payment_method, payment_status, session_notes, chief_complaint, treatment_given]
+       JSON.stringify(normalizedTherapies), totalDuration, fee_charged || 0, amount_paid || 0, payment_method, resolvedStatus, session_notes, chief_complaint, treatment_given]
     );
     const visit = visitResult.rows[0];
 
@@ -777,8 +821,9 @@ app.post('/api/visits', async (req, res) => {
 app.put('/api/visits/:id', async (req, res) => {
   const client = await pool.connect();
   try {
+    // payment_status is derived server-side (see POST /api/visits) and ignored if sent.
     const { visit_date, visit_time, therapist_name, therapies, fee_charged,
-            amount_paid, payment_method, payment_status, session_notes, chief_complaint, treatment_given } = req.body;
+            amount_paid, payment_method, session_notes, chief_complaint, treatment_given } = req.body;
 
     const { therapies: normalizedTherapies, error: therapiesError } = normalizeTherapies(therapies);
     if (therapiesError) return res.status(400).json({ error: therapiesError });
@@ -793,8 +838,8 @@ app.put('/api/visits/:id', async (req, res) => {
 
     const existing = await client.query(
       req.clinicId
-        ? 'SELECT amount_paid, (visit_date = CURRENT_DATE) AS is_today FROM visits WHERE id=$1 AND clinic_id=$2'
-        : 'SELECT amount_paid, (visit_date = CURRENT_DATE) AS is_today FROM visits WHERE id=$1',
+        ? 'SELECT patient_id, amount_paid, (visit_date = CURRENT_DATE) AS is_today FROM visits WHERE id=$1 AND clinic_id=$2'
+        : 'SELECT patient_id, amount_paid, (visit_date = CURRENT_DATE) AS is_today FROM visits WHERE id=$1',
       req.clinicId ? [req.params.id, req.clinicId] : [req.params.id]
     );
     if (!existing.rows.length) {
@@ -806,6 +851,10 @@ app.put('/api/visits/:id', async (req, res) => {
       return res.status(400).json({ error: 'Paid amount can only be edited on the day of the visit.' });
     }
 
+    // Exclude this visit from the balance so its own fee/payment never count against it.
+    const prior = await getPriorBalance(client, existing.rows[0].patient_id, req.clinicId, req.params.id);
+    const resolvedStatus = resolvePaymentStatus(fee_charged, amount_paid, prior.advance_credit);
+
     const result = await client.query(
       req.clinicId
         ? `UPDATE visits SET visit_date=$1, visit_time=$2, therapist_name=$3, therapy_type=$4, therapy_types=$5::jsonb, duration_minutes=$6,
@@ -816,9 +865,9 @@ app.put('/api/visits/:id', async (req, res) => {
            chief_complaint=$12, treatment_given=$13 WHERE id=$14 RETURNING *`,
       req.clinicId
         ? [normalizedVisitDate, visit_time, therapist_name, legacyTherapyType, JSON.stringify(normalizedTherapies), totalDuration, fee_charged || 0,
-           amount_paid || 0, payment_method, payment_status, session_notes, chief_complaint, treatment_given, req.params.id, req.clinicId]
+           amount_paid || 0, payment_method, resolvedStatus, session_notes, chief_complaint, treatment_given, req.params.id, req.clinicId]
         : [normalizedVisitDate, visit_time, therapist_name, legacyTherapyType, JSON.stringify(normalizedTherapies), totalDuration, fee_charged || 0,
-           amount_paid || 0, payment_method, payment_status, session_notes, chief_complaint, treatment_given, req.params.id]
+           amount_paid || 0, payment_method, resolvedStatus, session_notes, chief_complaint, treatment_given, req.params.id]
     );
     if (!result.rows.length) {
       await client.query('ROLLBACK');
@@ -1108,6 +1157,15 @@ app.get('/api/patient-ledger/:patient_id', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ---- PATIENT BALANCE (carried-forward dues / advance credit) ----
+app.get('/api/patient-balance/:patient_id', async (req, res) => {
+  try {
+    const excludeVisitId = parseInt(req.query.exclude_visit_id, 10) || null;
+    const balance = await getPriorBalance(pool, req.params.patient_id, req.clinicId, excludeVisitId);
+    res.json(balance);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // ---- PATIENT DUES ----
 app.get('/api/patient-dues', async (req, res) => {
   try {
@@ -1140,7 +1198,7 @@ app.get('/api/patient-dues', async (req, res) => {
       WHERE 1=1
       ${req.clinicId ? 'AND p.clinic_id = $1' : ''}
       ${patientFilter}
-      ${!patient_id ? 'AND COALESCE(v.total_charged,0) - COALESCE(pay.total_paid,0) > 0' : ''}
+      ${!patient_id ? 'AND COALESCE(v.total_charged,0) - COALESCE(pay.total_paid,0) <> 0' : ''}
       ORDER BY due_balance DESC
     `;
 
@@ -1159,7 +1217,14 @@ app.get('/api/dashboard', async (req, res) => {
       pool.query(req.clinicId ? `SELECT COALESCE(SUM(amount_paid),0) as total FROM visits WHERE visit_date = $1 AND clinic_id = $2` : `SELECT COALESCE(SUM(amount_paid),0) as total FROM visits WHERE visit_date = $1`, [today, ...(req.clinicId ? [req.clinicId] : [])]),
       pool.query(req.clinicId ? `SELECT COUNT(*) FROM patients WHERE is_active = true AND clinic_id = $1` : `SELECT COUNT(*) FROM patients WHERE is_active = true`, [ ...(req.clinicId ? [req.clinicId] : []) ]),
       pool.query(req.clinicId ? `SELECT COALESCE(SUM(amount),0) as total FROM daily_ledger WHERE entry_type='income' AND clinic_id = $1 AND DATE_TRUNC('month', entry_date) = DATE_TRUNC('month', NOW())` : `SELECT COALESCE(SUM(amount),0) as total FROM daily_ledger WHERE entry_type='income' AND DATE_TRUNC('month', entry_date) = DATE_TRUNC('month', NOW())`, [ ...(req.clinicId ? [req.clinicId] : []) ]),
-      pool.query(req.clinicId ? `SELECT (SELECT COALESCE(SUM(fee_charged),0) FROM visits WHERE clinic_id = $1) - (SELECT COALESCE(SUM(amount),0) FROM patient_payments WHERE clinic_id = $1) as total` : `SELECT (SELECT COALESCE(SUM(fee_charged),0) FROM visits) - (SELECT COALESCE(SUM(amount),0) FROM patient_payments) as total`, [ ...(req.clinicId ? [req.clinicId] : []) ]),
+      // Clamped per patient: an advance credit must not cancel out other patients' genuine dues.
+      pool.query(req.clinicId ? `SELECT COALESCE(SUM(GREATEST(bal,0)),0) as total FROM (
+                    SELECT COALESCE((SELECT SUM(fee_charged) FROM visits v WHERE v.patient_id = p.id AND v.clinic_id = $1),0)
+                         - COALESCE((SELECT SUM(amount) FROM patient_payments pp WHERE pp.patient_id = p.id AND pp.clinic_id = $1),0) AS bal
+                    FROM patients p WHERE p.clinic_id = $1) t` : `SELECT COALESCE(SUM(GREATEST(bal,0)),0) as total FROM (
+                    SELECT COALESCE((SELECT SUM(fee_charged) FROM visits v WHERE v.patient_id = p.id),0)
+                         - COALESCE((SELECT SUM(amount) FROM patient_payments pp WHERE pp.patient_id = p.id),0) AS bal
+                    FROM patients p) t`, [ ...(req.clinicId ? [req.clinicId] : []) ]),
       pool.query(req.clinicId ? `SELECT v.*, p.first_name, p.last_name, p.patient_id as pid FROM visits v 
                   JOIN patients p ON v.patient_id = p.id WHERE v.clinic_id = $1 ORDER BY v.created_at DESC LIMIT 5` : `SELECT v.*, p.first_name, p.last_name, p.patient_id as pid FROM visits v 
                   JOIN patients p ON v.patient_id = p.id ORDER BY v.created_at DESC LIMIT 5`, [ ...(req.clinicId ? [req.clinicId] : []) ]),
