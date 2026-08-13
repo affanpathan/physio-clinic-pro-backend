@@ -992,7 +992,7 @@ app.get('/api/ledger', async (req, res) => {
               to_char(l.entry_date,'YYYY-MM-DD') AS entry_date,
               l.entry_type, l.category, l.description, l.amount, l.payment_method, l.reference_number,
               l.patient_id, l.visit_id, l.created_at,
-              p.first_name, p.last_name, v.fee_charged, v.amount_paid, v.therapy_type, v.therapy_types
+              p.first_name, p.last_name, v.fee_charged, v.amount_paid, v.therapy_type, v.therapy_types, v.session_notes
            FROM daily_ledger l
            LEFT JOIN patients p ON l.patient_id = p.id
            LEFT JOIN visits v ON l.visit_id = v.id
@@ -1055,7 +1055,7 @@ app.get('/api/reports', async (req, res) => {
               to_char(l.entry_date,'YYYY-MM-DD') AS entry_date,
               l.entry_type, l.category, l.description, l.amount, l.payment_method, l.reference_number,
               l.patient_id, l.visit_id, l.created_at,
-              p.first_name, p.last_name, v.therapist_name
+              p.first_name, p.last_name, v.therapist_name, v.session_notes
            ${fromJoin}${where}
            ORDER BY l.entry_date DESC, l.created_at DESC
            LIMIT $${dataParams.length - 1} OFFSET $${dataParams.length}`;
