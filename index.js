@@ -139,6 +139,90 @@ function resolvePaymentStatus(fee, amountPaid, advanceCredit) {
   return 'pending';
 }
 
+// ---- CSV EXPORT HELPERS ----
+function csvEscape(value) {
+  if (value === null || value === undefined) return '';
+  const str = String(value);
+  if (/[",\n\r]/.test(str)) return `"${str.replace(/"/g, '""')}"`;
+  return str;
+}
+
+function csvRow(values) {
+  return values.map(csvEscape).join(',') + '\r\n';
+}
+
+function formatTimestamp(value) {
+  if (!value) return '';
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value);
+  return date.toISOString().slice(0, 19).replace('T', ' ');
+}
+
+// Mirrors frontend/src/utils/therapy.js getTherapyRows() — kept in sync manually since
+// backend and frontend are separate repos and cannot share this util.
+function getTherapyRows(v) {
+  if (Array.isArray(v.therapy_types) && v.therapy_types.length) {
+    if (typeof v.therapy_types[0] === 'object' && v.therapy_types[0] !== null) {
+      return v.therapy_types.map(t => ({ therapy_type: t.therapy_type, duration_minutes: t.duration_minutes }));
+    }
+    return v.therapy_types.map((t, idx) => ({ therapy_type: t, duration_minutes: idx === 0 ? (v.duration_minutes || 15) : 15 }));
+  }
+  if (v.therapy_type) return [{ therapy_type: v.therapy_type, duration_minutes: v.duration_minutes || 15 }];
+  return [];
+}
+
+function formatTherapies(row) {
+  return getTherapyRows(row).map(t => `${t.therapy_type} (${t.duration_minutes}m)`).join('; ');
+}
+
+function formatDateRangeLabel({ date, date_from, date_to }) {
+  if (date) return date;
+  if (date_from && date_to) return `${date_from} to ${date_to}`;
+  if (date_from) return `From ${date_from}`;
+  if (date_to) return `Until ${date_to}`;
+  return null;
+}
+
+async function resolveClinicName(clinicId) {
+  if (!clinicId) return 'All Clinics';
+  const { rows } = await pool.query('SELECT clinic_name FROM clinic_master WHERE id = $1', [clinicId]);
+  return rows[0]?.clinic_name || 'Unknown Clinic';
+}
+
+// Turns a patient_id filter param into a readable "Name (Code)" label for the export's
+// Filters line. Reads the name/code off an already-fetched row when available (sampleRow) to
+// avoid an extra query; only falls back to a lookup when the filtered result set was empty.
+async function describePatientFilter(patientId, clinicId, sampleRow) {
+  if (sampleRow) {
+    const code = sampleRow.pid || sampleRow.patient_code;
+    const name = [sampleRow.first_name, sampleRow.last_name].filter(Boolean).join(' ');
+    if (name || code) return `${name || 'Unknown'}${code ? ` (${code})` : ''}`;
+  }
+  const { rows } = await pool.query(
+    clinicId ? 'SELECT first_name, last_name, patient_id FROM patients WHERE id = $1 AND clinic_id = $2' : 'SELECT first_name, last_name, patient_id FROM patients WHERE id = $1',
+    clinicId ? [patientId, clinicId] : [patientId]
+  );
+  if (rows.length) return `${rows[0].first_name} ${rows[0].last_name} (${rows[0].patient_id})`;
+  return String(patientId);
+}
+
+function sendCsv(res, { module, clinicName, dateRangeLabel, filterLabels, columns, rows, filenamePrefix }) {
+  const lines = [];
+  lines.push(csvRow(['Module', module]));
+  lines.push(csvRow(['Clinic', clinicName]));
+  if (dateRangeLabel) lines.push(csvRow(['Date Range', dateRangeLabel]));
+  if (filterLabels && filterLabels.length) lines.push(csvRow(['Filters', filterLabels.join('; ')]));
+  lines.push(csvRow(['Generated On', formatTimestamp(new Date())]));
+  lines.push(csvRow([]));
+  lines.push(csvRow(columns.map(c => c.label)));
+  for (const row of rows) lines.push(csvRow(columns.map(c => c.value(row))));
+  const csv = '﻿' + lines.join('');
+  const today = new Date().toISOString().slice(0, 10);
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="${filenamePrefix}_export_${today}.csv"`);
+  res.send(csv);
+}
+
 // Initialize DB schema
 async function initDB() {
   await pool.query(`
@@ -347,6 +431,28 @@ app.get('/api/clinic-master', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+app.get('/api/clinic-master/export', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM clinic_master ORDER BY id ASC');
+    const columns = [
+      { label: 'Clinic Name', value: r => r.clinic_name },
+      { label: 'Contact Person', value: r => r.clinic_person },
+      { label: 'Phone', value: r => r.clinic_phone },
+      { label: 'Address', value: r => r.clinic_address },
+      { label: 'City', value: r => r.clinic_city },
+      { label: 'State', value: r => r.clinic_state },
+      { label: 'Country', value: r => r.clinic_country },
+      { label: 'Currency', value: r => r.currency },
+      { label: 'Currency Symbol', value: r => r.currency_symbol },
+      { label: 'Subscription Valid Until', value: r => r.last_date },
+      { label: 'Active', value: r => r.clinic_active ? 'Yes' : 'No' },
+      { label: 'Created At', value: r => formatTimestamp(r.created_at) },
+      { label: 'Updated At', value: r => formatTimestamp(r.updated_at) },
+    ];
+    sendCsv(res, { module: 'Clinic Master', clinicName: 'All Clinics', dateRangeLabel: null, filterLabels: [], columns, rows: result.rows, filenamePrefix: 'clinic-master' });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.get('/api/clinic-master/:id', async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM clinic_master WHERE id = $1', [req.params.id]);
@@ -399,6 +505,26 @@ app.get('/api/clinic-users', async (req, res) => {
     const params = req.clinicId ? [req.clinicId] : [];
     const result = await pool.query(query, params);
     res.json(result.rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/clinic-users/export', async (req, res) => {
+  try {
+    const query = req.clinicId
+      ? `SELECT cu.*, cm.clinic_name FROM clinic_users cu LEFT JOIN clinic_master cm ON cu.clinic_id = cm.id WHERE cu.clinic_id = $1 ORDER BY cu.id ASC`
+      : `SELECT cu.*, cm.clinic_name FROM clinic_users cu LEFT JOIN clinic_master cm ON cu.clinic_id = cm.id ORDER BY cu.id ASC`;
+    const params = req.clinicId ? [req.clinicId] : [];
+    const result = await pool.query(query, params);
+    const clinicName = await resolveClinicName(req.clinicId);
+    const columns = [
+      { label: 'User Name', value: r => r.user_name },
+      { label: 'User ID', value: r => r.user_id },
+      { label: 'Active', value: r => r.active ? 'Yes' : 'No' },
+      { label: 'Clinic Name', value: r => r.clinic_name },
+      { label: 'Created At', value: r => formatTimestamp(r.created_at) },
+      { label: 'Updated At', value: r => formatTimestamp(r.updated_at) },
+    ];
+    sendCsv(res, { module: 'Clinic Users', clinicName, dateRangeLabel: null, filterLabels: [], columns, rows: result.rows, filenamePrefix: 'clinic-users' });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -645,6 +771,27 @@ app.get('/api/therapists', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+app.get('/api/therapists/export', async (req, res) => {
+  try {
+    const query = req.clinicId
+      ? `SELECT t.*, cm.clinic_name FROM therapists t LEFT JOIN clinic_master cm ON t.clinic_id = cm.id WHERE t.clinic_id = $1 ORDER BY t.id ASC`
+      : `SELECT t.*, cm.clinic_name FROM therapists t LEFT JOIN clinic_master cm ON t.clinic_id = cm.id ORDER BY t.id ASC`;
+    const params = req.clinicId ? [req.clinicId] : [];
+    const result = await pool.query(query, params);
+    const clinicName = await resolveClinicName(req.clinicId);
+    const columns = [
+      { label: 'Therapist Name', value: r => r.therapist_name },
+      { label: 'Phone', value: r => r.phone },
+      { label: 'Address', value: r => r.address },
+      { label: 'Active', value: r => r.active ? 'Yes' : 'No' },
+      { label: 'Created At', value: r => formatTimestamp(r.created_at) },
+      { label: 'Updated At', value: r => formatTimestamp(r.updated_at) },
+    ];
+    if (!req.clinicId) columns.push({ label: 'Clinic Name', value: r => r.clinic_name });
+    sendCsv(res, { module: 'Therapists', clinicName, dateRangeLabel: null, filterLabels: [], columns, rows: result.rows, filenamePrefix: 'therapists' });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.get('/api/therapists/:id', async (req, res) => {
   try {
     const query = req.clinicId
@@ -727,6 +874,47 @@ app.get('/api/patients', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+app.get('/api/patients/export', async (req, res) => {
+  try {
+    const { search, active } = req.query;
+    let query = 'SELECT p.*, cm.clinic_name FROM patients p LEFT JOIN clinic_master cm ON p.clinic_id = cm.id WHERE 1=1';
+    const params = [];
+    if (req.clinicId) { params.push(req.clinicId); query += ` AND p.clinic_id = $${params.length}`; }
+    if (search) {
+      params.push(`%${search}%`);
+      query += ` AND (p.first_name ILIKE $${params.length} OR p.last_name ILIKE $${params.length} OR p.patient_id ILIKE $${params.length} OR p.phone ILIKE $${params.length})`;
+    }
+    if (active !== undefined) { params.push(active === 'true'); query += ` AND p.is_active = $${params.length}`; }
+    query += ' ORDER BY p.created_at DESC';
+    const result = await pool.query(query, params);
+    const clinicName = await resolveClinicName(req.clinicId);
+
+    const filterLabels = [];
+    if (search) filterLabels.push(`Search="${search}"`);
+    if (active !== undefined) filterLabels.push(`Status=${active === 'true' ? 'Active' : 'Inactive'}`);
+
+    const columns = [
+      { label: 'Patient Code', value: r => r.patient_id },
+      { label: 'First Name', value: r => r.first_name },
+      { label: 'Last Name', value: r => r.last_name },
+      { label: 'Phone', value: r => r.phone },
+      { label: 'Email', value: r => r.email },
+      { label: 'Date of Birth', value: r => r.date_of_birth },
+      { label: 'Age', value: r => r.age },
+      { label: 'Gender', value: r => r.gender },
+      { label: 'Address', value: r => r.address },
+      { label: 'Diagnosis', value: r => r.diagnosis },
+      { label: 'Referring Doctor', value: r => r.referring_doctor },
+      { label: 'Notes', value: r => r.notes },
+      { label: 'Active', value: r => r.is_active ? 'Yes' : 'No' },
+      { label: 'Created At', value: r => formatTimestamp(r.created_at) },
+      { label: 'Updated At', value: r => formatTimestamp(r.updated_at) },
+    ];
+    if (!req.clinicId) columns.push({ label: 'Clinic Name', value: r => r.clinic_name });
+    sendCsv(res, { module: 'Patients', clinicName, dateRangeLabel: null, filterLabels, columns, rows: result.rows, filenamePrefix: 'patients' });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.get('/api/patients/:id', async (req, res) => {
   try {
     const result = await pool.query(
@@ -789,6 +977,47 @@ app.get('/api/visits', async (req, res) => {
     query += ' ORDER BY v.visit_date DESC, v.visit_time DESC';
     const result = await pool.query(query, params);
     res.json(result.rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/visits/export', async (req, res) => {
+  try {
+    const { patient_id, date_from, date_to, date } = req.query;
+    let query = `SELECT v.*, p.first_name, p.last_name, p.patient_id as pid, cm.clinic_name
+                 FROM visits v JOIN patients p ON v.patient_id = p.id
+                 LEFT JOIN clinic_master cm ON v.clinic_id = cm.id WHERE 1=1`;
+    const params = [];
+    if (req.clinicId) { params.push(req.clinicId); query += ` AND v.clinic_id = $${params.length}`; }
+    if (patient_id) { params.push(patient_id); query += ` AND v.patient_id = $${params.length}`; }
+    if (date) { params.push(date); query += ` AND v.visit_date = $${params.length}`; }
+    if (date_from) { params.push(date_from); query += ` AND v.visit_date >= $${params.length}`; }
+    if (date_to) { params.push(date_to); query += ` AND v.visit_date <= $${params.length}`; }
+    query += ' ORDER BY v.visit_date DESC, v.visit_time DESC';
+    const result = await pool.query(query, params);
+    const clinicName = await resolveClinicName(req.clinicId);
+
+    const filterLabels = [];
+    if (patient_id) filterLabels.push(`Patient=${await describePatientFilter(patient_id, req.clinicId, result.rows[0])}`);
+
+    const columns = [
+      { label: 'Patient Code', value: r => r.pid },
+      { label: 'Patient Name', value: r => `${r.first_name} ${r.last_name}` },
+      { label: 'Visit Date', value: r => r.visit_date },
+      { label: 'Visit Time', value: r => r.visit_time },
+      { label: 'Therapist', value: r => r.therapist_name },
+      { label: 'Therapy Type(s)', value: r => formatTherapies(r) },
+      { label: 'Duration (min)', value: r => r.duration_minutes },
+      { label: 'Fee Charged', value: r => r.fee_charged },
+      { label: 'Amount Paid', value: r => r.amount_paid },
+      { label: 'Payment Method', value: r => r.payment_method },
+      { label: 'Payment Status', value: r => r.payment_status },
+      { label: 'Chief Complaint', value: r => r.chief_complaint },
+      { label: 'Treatment Given', value: r => r.treatment_given },
+      { label: 'Session Notes', value: r => r.session_notes },
+      { label: 'Created At', value: r => formatTimestamp(r.created_at) },
+    ];
+    if (!req.clinicId) columns.push({ label: 'Clinic Name', value: r => r.clinic_name });
+    sendCsv(res, { module: 'Visits', clinicName, dateRangeLabel: formatDateRangeLabel({ date, date_from, date_to }), filterLabels, columns, rows: result.rows, filenamePrefix: 'visits' });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -1009,6 +1238,56 @@ app.get('/api/ledger', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+app.get('/api/ledger/export', async (req, res) => {
+  try {
+    const { date, date_from, date_to, entry_type } = req.query;
+    let query = `SELECT l.id,
+              to_char(l.entry_date,'YYYY-MM-DD') AS entry_date,
+              l.entry_type, l.category, l.description, l.amount, l.payment_method, l.reference_number,
+              l.patient_id, l.visit_id, l.created_at,
+              p.first_name, p.last_name, p.patient_id as patient_code,
+              v.therapist_name, v.fee_charged, v.amount_paid, v.therapy_type, v.therapy_types, v.session_notes,
+              cm.clinic_name
+           FROM daily_ledger l
+           LEFT JOIN patients p ON l.patient_id = p.id
+           LEFT JOIN visits v ON l.visit_id = v.id
+           LEFT JOIN clinic_master cm ON l.clinic_id = cm.id
+           WHERE 1=1`;
+    const params = [];
+    if (req.clinicId) { params.push(req.clinicId); query += ` AND l.clinic_id = $${params.length}`; }
+    if (date) { params.push(date); query += ` AND l.entry_date = $${params.length}`; }
+    if (date_from) { params.push(date_from); query += ` AND l.entry_date >= $${params.length}`; }
+    if (date_to) { params.push(date_to); query += ` AND l.entry_date <= $${params.length}`; }
+    if (entry_type) { params.push(entry_type); query += ` AND l.entry_type = $${params.length}`; }
+    query += ' ORDER BY l.entry_date DESC, l.created_at DESC';
+    const result = await pool.query(query, params);
+    const clinicName = await resolveClinicName(req.clinicId);
+
+    const filterLabels = [];
+    if (entry_type) filterLabels.push(`Status=${entry_type === 'income' ? 'Income' : 'Expense'}`);
+
+    const columns = [
+      { label: 'Entry Date', value: r => r.entry_date },
+      { label: 'Entry Type', value: r => r.entry_type === 'income' ? 'Income' : 'Expense' },
+      { label: 'Category', value: r => r.category },
+      { label: 'Description', value: r => r.description },
+      { label: 'Amount', value: r => r.amount },
+      { label: 'Payment Method', value: r => r.payment_method },
+      { label: 'Reference Number', value: r => r.reference_number },
+      { label: 'Patient Code', value: r => r.patient_code },
+      { label: 'Patient Name', value: r => r.first_name ? `${r.first_name} ${r.last_name}` : '' },
+      { label: 'Therapist', value: r => r.therapist_name },
+      { label: 'Therapy Type(s)', value: r => r.visit_id ? formatTherapies(r) : '' },
+      { label: 'Fee Charged', value: r => r.fee_charged },
+      { label: 'Amount Paid', value: r => r.amount_paid },
+      { label: 'Session Notes', value: r => r.session_notes },
+      { label: 'Created At', value: r => formatTimestamp(r.created_at) },
+    ];
+    if (!req.clinicId) columns.push({ label: 'Clinic Name', value: r => r.clinic_name });
+    sendCsv(res, { module: 'Daily Ledger', clinicName, dateRangeLabel: formatDateRangeLabel({ date, date_from, date_to }), filterLabels, columns, rows: result.rows, filenamePrefix: 'daily-ledger' });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 const REPORTS_PAGE_SIZES = [25, 50, 75, 100];
 
 app.get('/api/reports', async (req, res) => {
@@ -1075,6 +1354,68 @@ app.get('/api/reports', async (req, res) => {
         onlineAmount: Number(summaryRow.online_amount),
       },
     });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/reports/export', async (req, res) => {
+  try {
+    const { date_from, date_to, entry_type, therapist_name, patient_id, payment_method } = req.query;
+    if (!date_from || !date_to) {
+      return res.status(400).json({ error: 'date_from and date_to are required' });
+    }
+
+    const whereParams = [];
+    let where = ' WHERE 1=1';
+    if (req.clinicId) { whereParams.push(req.clinicId); where += ` AND l.clinic_id = $${whereParams.length}`; }
+    whereParams.push(date_from); where += ` AND l.entry_date >= $${whereParams.length}`;
+    whereParams.push(date_to); where += ` AND l.entry_date <= $${whereParams.length}`;
+    if (entry_type) { whereParams.push(entry_type); where += ` AND l.entry_type = $${whereParams.length}`; }
+    if (therapist_name) { whereParams.push(therapist_name); where += ` AND v.therapist_name = $${whereParams.length}`; }
+    if (patient_id) { whereParams.push(patient_id); where += ` AND l.patient_id = $${whereParams.length}`; }
+    if (payment_method) { whereParams.push(payment_method); where += ` AND l.payment_method = $${whereParams.length}`; }
+
+    const fromJoin = ` FROM daily_ledger l
+           LEFT JOIN patients p ON l.patient_id = p.id
+           LEFT JOIN visits v ON l.visit_id = v.id
+           LEFT JOIN clinic_master cm ON l.clinic_id = cm.id`;
+
+    const dataQuery = `SELECT l.id,
+              to_char(l.entry_date,'YYYY-MM-DD') AS entry_date,
+              l.entry_type, l.category, l.description, l.amount, l.payment_method, l.reference_number,
+              l.patient_id, l.visit_id, l.created_at,
+              p.first_name, p.last_name, p.patient_id as patient_code,
+              v.therapist_name, v.fee_charged, v.amount_paid, v.therapy_type, v.therapy_types, v.session_notes,
+              cm.clinic_name
+           ${fromJoin}${where}
+           ORDER BY l.entry_date DESC, l.created_at DESC`;
+    const result = await pool.query(dataQuery, whereParams);
+    const clinicName = await resolveClinicName(req.clinicId);
+
+    const filterLabels = [];
+    if (entry_type) filterLabels.push(`Status=${entry_type === 'income' ? 'Income' : 'Expense'}`);
+    if (therapist_name) filterLabels.push(`Therapist=${therapist_name}`);
+    if (patient_id) filterLabels.push(`Patient=${await describePatientFilter(patient_id, req.clinicId, result.rows[0])}`);
+    if (payment_method) filterLabels.push(`Payment Method=${payment_method === 'cash' ? 'Cash' : 'Online / UPI'}`);
+
+    const columns = [
+      { label: 'Entry Date', value: r => r.entry_date },
+      { label: 'Entry Type', value: r => r.entry_type === 'income' ? 'Income' : 'Expense' },
+      { label: 'Category', value: r => r.category },
+      { label: 'Description', value: r => r.description },
+      { label: 'Patient Code', value: r => r.patient_code },
+      { label: 'Patient Name', value: r => r.first_name ? `${r.first_name} ${r.last_name}` : '' },
+      { label: 'Therapist', value: r => r.therapist_name },
+      { label: 'Therapy Type(s)', value: r => r.visit_id ? formatTherapies(r) : '' },
+      { label: 'Fee Charged', value: r => r.fee_charged },
+      { label: 'Amount Paid', value: r => r.amount_paid },
+      { label: 'Payment Method', value: r => r.payment_method },
+      { label: 'Amount', value: r => r.amount },
+      { label: 'Reference Number', value: r => r.reference_number },
+      { label: 'Session Notes', value: r => r.session_notes },
+      { label: 'Created At', value: r => formatTimestamp(r.created_at) },
+    ];
+    if (!req.clinicId) columns.push({ label: 'Clinic Name', value: r => r.clinic_name });
+    sendCsv(res, { module: 'Reports', clinicName, dateRangeLabel: formatDateRangeLabel({ date_from, date_to }), filterLabels, columns, rows: result.rows, filenamePrefix: 'reports' });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -1196,6 +1537,74 @@ app.get('/api/patient-ledger/:patient_id', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+app.get('/api/patient-ledger/:patient_id/export', async (req, res) => {
+  try {
+    const type = req.query.type === 'payments' ? 'payments' : 'visits';
+    const patientLookup = await pool.query(
+      req.clinicId ? 'SELECT first_name, last_name, patient_id FROM patients WHERE id = $1 AND clinic_id = $2' : 'SELECT first_name, last_name, patient_id FROM patients WHERE id = $1',
+      req.clinicId ? [req.params.patient_id, req.clinicId] : [req.params.patient_id]
+    );
+    const patientLabel = patientLookup.rows.length
+      ? `${patientLookup.rows[0].first_name} ${patientLookup.rows[0].last_name} (${patientLookup.rows[0].patient_id})`
+      : String(req.params.patient_id);
+    const clinicName = await resolveClinicName(req.clinicId);
+    const filterLabels = [`Patient=${patientLabel}`];
+
+    if (type === 'payments') {
+      const payments = await pool.query(
+        req.clinicId
+          ? `SELECT pp.id, pp.visit_id, to_char(pp.payment_date,'YYYY-MM-DD') AS payment_date, pp.amount, pp.payment_method, pp.reference_number, pp.notes, pp.created_at FROM patient_payments pp WHERE pp.patient_id = $1 AND pp.clinic_id = $2 ORDER BY pp.payment_date DESC`
+          : `SELECT pp.id, pp.visit_id, to_char(pp.payment_date,'YYYY-MM-DD') AS payment_date, pp.amount, pp.payment_method, pp.reference_number, pp.notes, pp.created_at FROM patient_payments pp WHERE pp.patient_id = $1 ORDER BY pp.payment_date DESC`,
+        req.clinicId ? [req.params.patient_id, req.clinicId] : [req.params.patient_id]
+      );
+      const columns = [
+        { label: 'Payment Date', value: r => r.payment_date },
+        { label: 'Amount', value: r => r.amount },
+        { label: 'Payment Method', value: r => r.payment_method },
+        { label: 'Reference Number', value: r => r.reference_number },
+        { label: 'Notes', value: r => r.notes },
+        { label: 'Created At', value: r => formatTimestamp(r.created_at) },
+      ];
+      return sendCsv(res, { module: 'Patient Ledger — Payments', clinicName, dateRangeLabel: null, filterLabels, columns, rows: payments.rows, filenamePrefix: 'patient-ledger-payments' });
+    }
+
+    const visits = await pool.query(
+      req.clinicId
+        ? `SELECT v.id, v.patient_id, v.therapy_plan_id, to_char(v.visit_date,'YYYY-MM-DD') AS visit_date,
+              v.visit_time, v.therapist_name, v.therapy_type, v.therapy_types, v.duration_minutes,
+              v.fee_charged, v.amount_paid, v.payment_method, v.payment_status,
+              v.session_notes, v.chief_complaint, v.treatment_given, v.created_at
+         FROM visits v
+         WHERE v.patient_id = $1 AND v.clinic_id = $2
+         ORDER BY v.visit_date DESC`
+        : `SELECT v.id, v.patient_id, v.therapy_plan_id, to_char(v.visit_date,'YYYY-MM-DD') AS visit_date,
+              v.visit_time, v.therapist_name, v.therapy_type, v.therapy_types, v.duration_minutes,
+              v.fee_charged, v.amount_paid, v.payment_method, v.payment_status,
+              v.session_notes, v.chief_complaint, v.treatment_given, v.created_at
+         FROM visits v
+         WHERE v.patient_id = $1
+         ORDER BY v.visit_date DESC`,
+      req.clinicId ? [req.params.patient_id, req.clinicId] : [req.params.patient_id]
+    );
+    const columns = [
+      { label: 'Visit Date', value: r => r.visit_date },
+      { label: 'Visit Time', value: r => r.visit_time },
+      { label: 'Therapist', value: r => r.therapist_name },
+      { label: 'Therapy Type(s)', value: r => formatTherapies(r) },
+      { label: 'Duration (min)', value: r => r.duration_minutes },
+      { label: 'Fee Charged', value: r => r.fee_charged },
+      { label: 'Amount Paid', value: r => r.amount_paid },
+      { label: 'Payment Method', value: r => r.payment_method },
+      { label: 'Payment Status', value: r => r.payment_status },
+      { label: 'Chief Complaint', value: r => r.chief_complaint },
+      { label: 'Treatment Given', value: r => r.treatment_given },
+      { label: 'Session Notes', value: r => r.session_notes },
+      { label: 'Created At', value: r => formatTimestamp(r.created_at) },
+    ];
+    sendCsv(res, { module: 'Patient Ledger — Visit History', clinicName, dateRangeLabel: null, filterLabels, columns, rows: visits.rows, filenamePrefix: 'patient-ledger-visits' });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // ---- PATIENT BALANCE (carried-forward dues / advance credit) ----
 app.get('/api/patient-balance/:patient_id', async (req, res) => {
   try {
@@ -1243,6 +1652,60 @@ app.get('/api/patient-dues', async (req, res) => {
 
     const result = await pool.query(query, params);
     res.json(result.rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/patient-dues/export', async (req, res) => {
+  try {
+    const { patient_id } = req.query;
+    const params = [];
+    const clinicFilter = req.clinicId ? ' AND clinic_id = $1' : '';
+    const patientFilter = patient_id ? ` AND p.id = $${req.clinicId ? 2 : 1}` : '';
+
+    if (req.clinicId) params.push(req.clinicId);
+    if (patient_id) params.push(patient_id);
+
+    const query = `
+      SELECT p.id, p.patient_id as patient_code, p.first_name, p.last_name, cm.clinic_name,
+             COALESCE(v.total_charged,0) as total_charged,
+             COALESCE(pay.total_paid,0) as total_paid,
+             COALESCE(v.total_charged,0) - COALESCE(pay.total_paid,0) as due_balance
+      FROM patients p
+      LEFT JOIN clinic_master cm ON p.clinic_id = cm.id
+      LEFT JOIN (
+        SELECT patient_id, SUM(fee_charged) AS total_charged
+        FROM visits
+        WHERE 1=1${clinicFilter}
+        GROUP BY patient_id
+      ) v ON v.patient_id = p.id
+      LEFT JOIN (
+        SELECT patient_id, SUM(amount) AS total_paid
+        FROM patient_payments
+        WHERE 1=1${clinicFilter}
+        GROUP BY patient_id
+      ) pay ON pay.patient_id = p.id
+      WHERE 1=1
+      ${req.clinicId ? 'AND p.clinic_id = $1' : ''}
+      ${patientFilter}
+      ${!patient_id ? 'AND COALESCE(v.total_charged,0) - COALESCE(pay.total_paid,0) <> 0' : ''}
+      ORDER BY due_balance DESC
+    `;
+
+    const result = await pool.query(query, params);
+    const clinicName = await resolveClinicName(req.clinicId);
+
+    const filterLabels = [];
+    if (patient_id) filterLabels.push(`Patient=${await describePatientFilter(patient_id, req.clinicId, result.rows[0])}`);
+
+    const columns = [
+      { label: 'Patient Code', value: r => r.patient_code },
+      { label: 'Patient Name', value: r => `${r.first_name} ${r.last_name}` },
+      { label: 'Total Charged', value: r => r.total_charged },
+      { label: 'Total Paid', value: r => r.total_paid },
+      { label: 'Balance', value: r => r.due_balance },
+    ];
+    if (!req.clinicId) columns.push({ label: 'Clinic Name', value: r => r.clinic_name });
+    sendCsv(res, { module: 'Patient Dues', clinicName, dateRangeLabel: null, filterLabels, columns, rows: result.rows, filenamePrefix: 'patient-dues' });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
