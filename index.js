@@ -516,6 +516,45 @@ app.post('/api/clinic-users/login', async (req, res) => {
   }
 });
 
+app.post('/api/change-password', async (req, res) => {
+  try {
+    const { user_id, current_password, new_password } = req.body;
+    if (!user_id || !current_password || !new_password) {
+      return res.status(400).json({ success: false, error: 'User ID, current password, and new password are required.' });
+    }
+    if (String(new_password).length < 6) {
+      return res.status(400).json({ success: false, error: 'New password must be at least 6 characters.' });
+    }
+
+    const userQuery = req.clinicId
+      ? `SELECT id, user_pass FROM clinic_users WHERE LOWER(TRIM(user_id)) = LOWER(TRIM($1)) AND clinic_id = $2 AND active = TRUE`
+      : `SELECT id, user_pass FROM clinic_users WHERE LOWER(TRIM(user_id)) = LOWER(TRIM($1)) AND active = TRUE`;
+    const params = req.clinicId ? [String(user_id).trim(), req.clinicId] : [String(user_id).trim()];
+    const result = await pool.query(userQuery, params);
+
+    if (result.rows.length === 0) {
+      return res.status(401).json({ success: false, error: 'Invalid user ID or password.' });
+    }
+
+    const userRecord = result.rows[0];
+    const storedPassword = String(userRecord.user_pass || '');
+    const isPasswordValid = /^\$2[aby]\$/.test(storedPassword)
+      ? await bcrypt.compare(current_password, storedPassword)
+      : current_password === storedPassword;
+
+    if (!isPasswordValid) {
+      return res.status(401).json({ success: false, error: 'Invalid user ID or password.' });
+    }
+
+    const hashedNewPassword = await bcrypt.hash(new_password, 10);
+    await pool.query('UPDATE clinic_users SET user_pass = $1, updated_at = NOW() WHERE id = $2', [hashedNewPassword, userRecord.id]);
+
+    res.json({ success: true, message: 'Password changed successfully. Please log in again.' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post('/api/admin/validate', async (req, res) => {
   try {
     const { password } = req.body;
