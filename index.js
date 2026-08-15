@@ -1292,7 +1292,7 @@ const REPORTS_PAGE_SIZES = [25, 50, 75, 100];
 
 app.get('/api/reports', async (req, res) => {
   try {
-    const { date_from, date_to, entry_type, therapist_name, patient_id, payment_method } = req.query;
+    const { date_from, date_to, entry_type, category, exclude_category, therapist_name, patient_id, payment_method } = req.query;
     if (!date_from || !date_to) {
       return res.status(400).json({ error: 'date_from and date_to are required' });
     }
@@ -1307,6 +1307,14 @@ app.get('/api/reports', async (req, res) => {
     whereParams.push(date_from); where += ` AND l.entry_date >= $${whereParams.length}`;
     whereParams.push(date_to); where += ` AND l.entry_date <= $${whereParams.length}`;
     if (entry_type) { whereParams.push(entry_type); where += ` AND l.entry_type = $${whereParams.length}`; }
+    if (category) {
+      const categories = category.split(',').map(c => c.trim()).filter(Boolean);
+      whereParams.push(categories); where += ` AND l.category = ANY($${whereParams.length})`;
+    }
+    if (exclude_category) {
+      const excluded = exclude_category.split(',').map(c => c.trim()).filter(Boolean);
+      whereParams.push(excluded); where += ` AND (l.category IS NULL OR NOT (l.category = ANY($${whereParams.length})))`;
+    }
     if (therapist_name) { whereParams.push(therapist_name); where += ` AND v.therapist_name = $${whereParams.length}`; }
     if (patient_id) { whereParams.push(patient_id); where += ` AND l.patient_id = $${whereParams.length}`; }
     if (payment_method) { whereParams.push(payment_method); where += ` AND l.payment_method = $${whereParams.length}`; }
@@ -1359,7 +1367,7 @@ app.get('/api/reports', async (req, res) => {
 
 app.get('/api/reports/export', async (req, res) => {
   try {
-    const { date_from, date_to, entry_type, therapist_name, patient_id, payment_method } = req.query;
+    const { date_from, date_to, entry_type, category, exclude_category, therapist_name, patient_id, payment_method } = req.query;
     if (!date_from || !date_to) {
       return res.status(400).json({ error: 'date_from and date_to are required' });
     }
@@ -1370,6 +1378,14 @@ app.get('/api/reports/export', async (req, res) => {
     whereParams.push(date_from); where += ` AND l.entry_date >= $${whereParams.length}`;
     whereParams.push(date_to); where += ` AND l.entry_date <= $${whereParams.length}`;
     if (entry_type) { whereParams.push(entry_type); where += ` AND l.entry_type = $${whereParams.length}`; }
+    if (category) {
+      const categories = category.split(',').map(c => c.trim()).filter(Boolean);
+      whereParams.push(categories); where += ` AND l.category = ANY($${whereParams.length})`;
+    }
+    if (exclude_category) {
+      const excluded = exclude_category.split(',').map(c => c.trim()).filter(Boolean);
+      whereParams.push(excluded); where += ` AND (l.category IS NULL OR NOT (l.category = ANY($${whereParams.length})))`;
+    }
     if (therapist_name) { whereParams.push(therapist_name); where += ` AND v.therapist_name = $${whereParams.length}`; }
     if (patient_id) { whereParams.push(patient_id); where += ` AND l.patient_id = $${whereParams.length}`; }
     if (payment_method) { whereParams.push(payment_method); where += ` AND l.payment_method = $${whereParams.length}`; }
@@ -1393,6 +1409,8 @@ app.get('/api/reports/export', async (req, res) => {
 
     const filterLabels = [];
     if (entry_type) filterLabels.push(`Status=${entry_type === 'income' ? 'Income' : 'Expense'}`);
+    if (category) filterLabels.push(`Category=${category}`);
+    if (exclude_category) filterLabels.push(`Excludes=${exclude_category}`);
     if (therapist_name) filterLabels.push(`Therapist=${therapist_name}`);
     if (patient_id) filterLabels.push(`Patient=${await describePatientFilter(patient_id, req.clinicId, result.rows[0])}`);
     if (payment_method) filterLabels.push(`Payment Method=${payment_method === 'cash' ? 'Cash' : 'Online / UPI'}`);
