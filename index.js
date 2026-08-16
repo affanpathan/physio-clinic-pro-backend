@@ -937,6 +937,14 @@ app.put('/api/products/:id', async (req, res) => {
 
 app.delete('/api/products/:id', async (req, res) => {
   try {
+    const checkQuery = req.clinicId
+      ? 'SELECT 1 FROM daily_ledger WHERE product_id = $1 AND clinic_id = $2 LIMIT 1'
+      : 'SELECT 1 FROM daily_ledger WHERE product_id = $1 LIMIT 1';
+    const checkParams = req.clinicId ? [req.params.id, req.clinicId] : [req.params.id];
+    const inUse = await pool.query(checkQuery, checkParams);
+    if (inUse.rows.length) {
+      return res.status(409).json({ error: 'This product has already been sold and cannot be deleted. Mark it inactive instead to hide it from new sales.' });
+    }
     const query = req.clinicId ? 'DELETE FROM products WHERE id = $1 AND clinic_id = $2 RETURNING id' : 'DELETE FROM products WHERE id = $1 RETURNING id';
     const params = req.clinicId ? [req.params.id, req.clinicId] : [req.params.id];
     const result = await pool.query(query, params);
@@ -1316,10 +1324,12 @@ app.get('/api/ledger', async (req, res) => {
               to_char(l.entry_date,'YYYY-MM-DD') AS entry_date,
               l.entry_type, l.category, l.description, l.amount, l.payment_method, l.reference_number,
               l.patient_id, l.visit_id, l.created_at,
+              l.product_id, pr.product_name,
               p.first_name, p.last_name, v.fee_charged, v.amount_paid, v.therapy_type, v.therapy_types, v.session_notes
            FROM daily_ledger l
            LEFT JOIN patients p ON l.patient_id = p.id
            LEFT JOIN visits v ON l.visit_id = v.id
+           LEFT JOIN products pr ON l.product_id = pr.id
            WHERE 1=1`;
     const params = [];
     if (req.clinicId) { params.push(req.clinicId); query += ` AND l.clinic_id = $${params.length}`; }
@@ -1340,6 +1350,7 @@ app.get('/api/ledger/export', async (req, res) => {
               to_char(l.entry_date,'YYYY-MM-DD') AS entry_date,
               l.entry_type, l.category, l.description, l.amount, l.payment_method, l.reference_number,
               l.patient_id, l.visit_id, l.created_at,
+              l.product_id, pr.product_name,
               p.first_name, p.last_name, p.patient_id as patient_code,
               v.therapist_name, v.fee_charged, v.amount_paid, v.therapy_type, v.therapy_types, v.session_notes,
               cm.clinic_name
@@ -1347,6 +1358,7 @@ app.get('/api/ledger/export', async (req, res) => {
            LEFT JOIN patients p ON l.patient_id = p.id
            LEFT JOIN visits v ON l.visit_id = v.id
            LEFT JOIN clinic_master cm ON l.clinic_id = cm.id
+           LEFT JOIN products pr ON l.product_id = pr.id
            WHERE 1=1`;
     const params = [];
     if (req.clinicId) { params.push(req.clinicId); query += ` AND l.clinic_id = $${params.length}`; }
@@ -1364,7 +1376,7 @@ app.get('/api/ledger/export', async (req, res) => {
     const columns = [
       { label: 'Entry Date', value: r => r.entry_date },
       { label: 'Entry Type', value: r => r.entry_type === 'income' ? 'Income' : 'Expense' },
-      { label: 'Category', value: r => r.category },
+      { label: 'Category', value: r => (r.category === 'Product Sale' && r.product_name) ? r.product_name : r.category },
       { label: 'Description', value: r => r.description },
       { label: 'Amount', value: r => r.amount },
       { label: 'Payment Method', value: r => r.payment_method },
@@ -1418,7 +1430,8 @@ app.get('/api/reports', async (req, res) => {
 
     const fromJoin = ` FROM daily_ledger l
            LEFT JOIN patients p ON l.patient_id = p.id
-           LEFT JOIN visits v ON l.visit_id = v.id`;
+           LEFT JOIN visits v ON l.visit_id = v.id
+           LEFT JOIN products pr ON l.product_id = pr.id`;
 
     const summaryResult = await pool.query(
       `SELECT COUNT(*) AS total,
@@ -1439,6 +1452,7 @@ app.get('/api/reports', async (req, res) => {
               to_char(l.entry_date,'YYYY-MM-DD') AS entry_date,
               l.entry_type, l.category, l.description, l.amount, l.payment_method, l.reference_number,
               l.patient_id, l.visit_id, l.created_at,
+              l.product_id, pr.product_name,
               p.first_name, p.last_name, v.therapist_name, v.session_notes
            ${fromJoin}${where}
            ORDER BY l.entry_date DESC, l.created_at DESC
@@ -1492,12 +1506,14 @@ app.get('/api/reports/export', async (req, res) => {
     const fromJoin = ` FROM daily_ledger l
            LEFT JOIN patients p ON l.patient_id = p.id
            LEFT JOIN visits v ON l.visit_id = v.id
-           LEFT JOIN clinic_master cm ON l.clinic_id = cm.id`;
+           LEFT JOIN clinic_master cm ON l.clinic_id = cm.id
+           LEFT JOIN products pr ON l.product_id = pr.id`;
 
     const dataQuery = `SELECT l.id,
               to_char(l.entry_date,'YYYY-MM-DD') AS entry_date,
               l.entry_type, l.category, l.description, l.amount, l.payment_method, l.reference_number,
               l.patient_id, l.visit_id, l.created_at,
+              l.product_id, pr.product_name,
               p.first_name, p.last_name, p.patient_id as patient_code,
               v.therapist_name, v.fee_charged, v.amount_paid, v.therapy_type, v.therapy_types, v.session_notes,
               cm.clinic_name
@@ -1519,7 +1535,7 @@ app.get('/api/reports/export', async (req, res) => {
     const columns = [
       { label: 'Entry Date', value: r => r.entry_date },
       { label: 'Entry Type', value: r => r.entry_type === 'income' ? 'Income' : 'Expense' },
-      { label: 'Category', value: r => r.category },
+      { label: 'Category / Product', value: r => (r.category === 'Product Sale' && r.product_name) ? r.product_name : r.category },
       { label: 'Description', value: r => r.description },
       { label: 'Patient Code', value: r => r.patient_code },
       { label: 'Patient Name', value: r => r.first_name ? `${r.first_name} ${r.last_name}` : '' },
