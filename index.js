@@ -1316,7 +1316,8 @@ app.get('/api/reports', async (req, res) => {
       whereParams.push(excluded); where += ` AND (l.category IS NULL OR NOT (l.category = ANY($${whereParams.length})))`;
     }
     if (therapist_name) { whereParams.push(therapist_name); where += ` AND v.therapist_name = $${whereParams.length}`; }
-    if (patient_id) { whereParams.push(patient_id); where += ` AND l.patient_id = $${whereParams.length}`; }
+    if (patient_id === 'all') { where += ' AND l.patient_id IS NOT NULL'; }
+    else if (patient_id) { whereParams.push(patient_id); where += ` AND l.patient_id = $${whereParams.length}`; }
     if (payment_method) { whereParams.push(payment_method); where += ` AND l.payment_method = $${whereParams.length}`; }
 
     const fromJoin = ` FROM daily_ledger l
@@ -1387,7 +1388,8 @@ app.get('/api/reports/export', async (req, res) => {
       whereParams.push(excluded); where += ` AND (l.category IS NULL OR NOT (l.category = ANY($${whereParams.length})))`;
     }
     if (therapist_name) { whereParams.push(therapist_name); where += ` AND v.therapist_name = $${whereParams.length}`; }
-    if (patient_id) { whereParams.push(patient_id); where += ` AND l.patient_id = $${whereParams.length}`; }
+    if (patient_id === 'all') { where += ' AND l.patient_id IS NOT NULL'; }
+    else if (patient_id) { whereParams.push(patient_id); where += ` AND l.patient_id = $${whereParams.length}`; }
     if (payment_method) { whereParams.push(payment_method); where += ` AND l.payment_method = $${whereParams.length}`; }
 
     const fromJoin = ` FROM daily_ledger l
@@ -1412,7 +1414,8 @@ app.get('/api/reports/export', async (req, res) => {
     if (category) filterLabels.push(`Category=${category}`);
     if (exclude_category) filterLabels.push(`Excludes=${exclude_category}`);
     if (therapist_name) filterLabels.push(`Therapist=${therapist_name}`);
-    if (patient_id) filterLabels.push(`Patient=${await describePatientFilter(patient_id, req.clinicId, result.rows[0])}`);
+    if (patient_id === 'all') filterLabels.push('Patient=All');
+    else if (patient_id) filterLabels.push(`Patient=${await describePatientFilter(patient_id, req.clinicId, result.rows[0])}`);
     if (payment_method) filterLabels.push(`Payment Method=${payment_method === 'cash' ? 'Cash' : 'Online / UPI'}`);
 
     const columns = [
