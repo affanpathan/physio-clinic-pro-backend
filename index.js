@@ -189,6 +189,11 @@ async function resolveClinicName(clinicId) {
   return rows[0]?.clinic_name || 'Unknown Clinic';
 }
 
+async function resolveProductName(productId) {
+  const { rows } = await pool.query('SELECT product_name FROM products WHERE id = $1', [productId]);
+  return rows[0]?.product_name || 'Unknown Product';
+}
+
 // Turns a patient_id filter param into a readable "Name (Code)" label for the export's
 // Filters line. Reads the name/code off an already-fetched row when available (sampleRow) to
 // avoid an extra query; only falls back to a lookup when the filtered result set was empty.
@@ -334,6 +339,17 @@ async function initDB() {
       updated_at TIMESTAMP DEFAULT NOW()
     );
 
+    CREATE TABLE IF NOT EXISTS products (
+      id SERIAL PRIMARY KEY,
+      clinic_id INTEGER REFERENCES clinic_master(id) ON DELETE CASCADE,
+      product_name VARCHAR(200) NOT NULL,
+      description TEXT,
+      price NUMERIC(10,2) DEFAULT 0,
+      is_active BOOLEAN DEFAULT TRUE,
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+
     CREATE TABLE IF NOT EXISTS clinic_master (
       id SERIAL PRIMARY KEY,
       clinic_name VARCHAR(200) NOT NULL,
@@ -380,6 +396,8 @@ async function initDB() {
     ALTER TABLE patient_payments ADD COLUMN IF NOT EXISTS clinic_id INTEGER REFERENCES clinic_master(id) ON DELETE CASCADE;
     ALTER TABLE patient_payments ADD COLUMN IF NOT EXISTS ledger_id INTEGER REFERENCES daily_ledger(id) ON DELETE SET NULL;
     ALTER TABLE daily_ledger ADD COLUMN IF NOT EXISTS clinic_id INTEGER REFERENCES clinic_master(id) ON DELETE CASCADE;
+    ALTER TABLE daily_ledger ADD COLUMN IF NOT EXISTS product_id INTEGER REFERENCES products(id) ON DELETE SET NULL;
+    ALTER TABLE products ADD COLUMN IF NOT EXISTS clinic_id INTEGER REFERENCES clinic_master(id) ON DELETE CASCADE;
     ALTER TABLE appointments ADD COLUMN IF NOT EXISTS clinic_id INTEGER REFERENCES clinic_master(id) ON DELETE CASCADE;
     ALTER TABLE therapists ADD COLUMN IF NOT EXISTS clinic_id INTEGER REFERENCES clinic_master(id) ON DELETE CASCADE;
     ALTER TABLE clinic_master ADD COLUMN IF NOT EXISTS currency VARCHAR(10) DEFAULT 'INR';
@@ -398,6 +416,8 @@ async function initDB() {
     CREATE INDEX IF NOT EXISTS idx_payments_patient ON patient_payments(patient_id);
     CREATE INDEX IF NOT EXISTS idx_appointments_patient ON appointments(patient_id);
     CREATE INDEX IF NOT EXISTS idx_appointments_date ON appointments(appointment_date);
+    CREATE INDEX IF NOT EXISTS idx_products_clinic ON products(clinic_id);
+    CREATE INDEX IF NOT EXISTS idx_ledger_product ON daily_ledger(product_id);
   `);
   console.log('Database initialized');
 }
@@ -850,6 +870,81 @@ app.delete('/api/therapists/:id', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ---- PRODUCTS ----
+app.get('/api/products', async (req, res) => {
+  try {
+    const conditions = [];
+    const params = [];
+    if (req.clinicId) { params.push(req.clinicId); conditions.push(`p.clinic_id = $${params.length}`); }
+    if (req.query.active === 'true' || req.query.active === 'false') {
+      params.push(req.query.active === 'true');
+      conditions.push(`p.is_active = $${params.length}`);
+    }
+    const where = conditions.length ? ` WHERE ${conditions.join(' AND ')}` : '';
+    const query = `SELECT p.*, cm.clinic_name FROM products p LEFT JOIN clinic_master cm ON p.clinic_id = cm.id${where} ORDER BY p.product_name ASC`;
+    const result = await pool.query(query, params);
+    res.json(result.rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/products/:id', async (req, res) => {
+  try {
+    const query = req.clinicId
+      ? `SELECT p.*, cm.clinic_name FROM products p LEFT JOIN clinic_master cm ON p.clinic_id = cm.id WHERE p.id = $1 AND p.clinic_id = $2`
+      : `SELECT p.*, cm.clinic_name FROM products p LEFT JOIN clinic_master cm ON p.clinic_id = cm.id WHERE p.id = $1`;
+    const params = req.clinicId ? [req.params.id, req.clinicId] : [req.params.id];
+    const result = await pool.query(query, params);
+    if (!result.rows.length) return res.status(404).json({ error: 'Not found' });
+    res.json(result.rows[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/products', async (req, res) => {
+  try {
+    const { clinic_id, product_name, description, price, is_active } = req.body;
+    if (!product_name || !product_name.trim()) {
+      return res.status(400).json({ error: 'Product name is required.' });
+    }
+    const targetClinicId = clinic_id || req.clinicId || null;
+    const result = await pool.query(
+      `INSERT INTO products (clinic_id, product_name, description, price, is_active)
+       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+      [targetClinicId, product_name.trim(), description || '', price || 0, is_active !== undefined ? is_active : true]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.put('/api/products/:id', async (req, res) => {
+  try {
+    const { clinic_id, product_name, description, price, is_active } = req.body;
+    if (!product_name || !product_name.trim()) {
+      return res.status(400).json({ error: 'Product name is required.' });
+    }
+    const targetClinicId = clinic_id || req.clinicId || null;
+    const clinicFilter = req.clinicId && !req.isAdmin ? ' AND clinic_id = $7' : '';
+    const query = req.clinicId && !req.isAdmin
+      ? `UPDATE products SET clinic_id = $1, product_name = $2, description = $3, price = $4, is_active = $5, updated_at = NOW() WHERE id = $6${clinicFilter} RETURNING *`
+      : `UPDATE products SET clinic_id = $1, product_name = $2, description = $3, price = $4, is_active = $5, updated_at = NOW() WHERE id = $6 RETURNING *`;
+    const params = req.clinicId && !req.isAdmin
+      ? [targetClinicId, product_name.trim(), description || '', price || 0, is_active !== undefined ? is_active : true, req.params.id, req.clinicId]
+      : [targetClinicId, product_name.trim(), description || '', price || 0, is_active !== undefined ? is_active : true, req.params.id];
+    const result = await pool.query(query, params);
+    if (!result.rows.length) return res.status(404).json({ error: 'Not found' });
+    res.json(result.rows[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete('/api/products/:id', async (req, res) => {
+  try {
+    const query = req.clinicId ? 'DELETE FROM products WHERE id = $1 AND clinic_id = $2 RETURNING id' : 'DELETE FROM products WHERE id = $1 RETURNING id';
+    const params = req.clinicId ? [req.params.id, req.clinicId] : [req.params.id];
+    const result = await pool.query(query, params);
+    if (!result.rows.length) return res.status(404).json({ error: 'Not found' });
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // ---- PATIENTS ----
 app.get('/api/patients', async (req, res) => {
   try {
@@ -1292,7 +1387,7 @@ const REPORTS_PAGE_SIZES = [25, 50, 75, 100];
 
 app.get('/api/reports', async (req, res) => {
   try {
-    const { date_from, date_to, entry_type, category, exclude_category, therapist_name, patient_id, payment_method } = req.query;
+    const { date_from, date_to, entry_type, category, exclude_category, therapist_name, patient_id, payment_method, product_id } = req.query;
     if (!date_from || !date_to) {
       return res.status(400).json({ error: 'date_from and date_to are required' });
     }
@@ -1319,6 +1414,7 @@ app.get('/api/reports', async (req, res) => {
     if (patient_id === 'all') { where += ' AND l.patient_id IS NOT NULL'; }
     else if (patient_id) { whereParams.push(patient_id); where += ` AND l.patient_id = $${whereParams.length}`; }
     if (payment_method) { whereParams.push(payment_method); where += ` AND l.payment_method = $${whereParams.length}`; }
+    if (product_id) { whereParams.push(product_id); where += ` AND l.product_id = $${whereParams.length}`; }
 
     const fromJoin = ` FROM daily_ledger l
            LEFT JOIN patients p ON l.patient_id = p.id
@@ -1368,7 +1464,7 @@ app.get('/api/reports', async (req, res) => {
 
 app.get('/api/reports/export', async (req, res) => {
   try {
-    const { date_from, date_to, entry_type, category, exclude_category, therapist_name, patient_id, payment_method } = req.query;
+    const { date_from, date_to, entry_type, category, exclude_category, therapist_name, patient_id, payment_method, product_id } = req.query;
     if (!date_from || !date_to) {
       return res.status(400).json({ error: 'date_from and date_to are required' });
     }
@@ -1391,6 +1487,7 @@ app.get('/api/reports/export', async (req, res) => {
     if (patient_id === 'all') { where += ' AND l.patient_id IS NOT NULL'; }
     else if (patient_id) { whereParams.push(patient_id); where += ` AND l.patient_id = $${whereParams.length}`; }
     if (payment_method) { whereParams.push(payment_method); where += ` AND l.payment_method = $${whereParams.length}`; }
+    if (product_id) { whereParams.push(product_id); where += ` AND l.product_id = $${whereParams.length}`; }
 
     const fromJoin = ` FROM daily_ledger l
            LEFT JOIN patients p ON l.patient_id = p.id
@@ -1417,6 +1514,7 @@ app.get('/api/reports/export', async (req, res) => {
     if (patient_id === 'all') filterLabels.push('Patient=All');
     else if (patient_id) filterLabels.push(`Patient=${await describePatientFilter(patient_id, req.clinicId, result.rows[0])}`);
     if (payment_method) filterLabels.push(`Payment Method=${payment_method === 'cash' ? 'Cash' : 'Online / UPI'}`);
+    if (product_id) filterLabels.push(`Product=${await resolveProductName(product_id)}`);
 
     const columns = [
       { label: 'Entry Date', value: r => r.entry_date },
@@ -1443,22 +1541,24 @@ app.get('/api/reports/export', async (req, res) => {
 app.post('/api/ledger', async (req, res) => {
   const client = await pool.connect();
   try {
-    const { entry_date, entry_type, category, description, amount, payment_method, reference_number, patient_id } = req.body;
+    const { entry_date, entry_type, category, description, amount, payment_method, reference_number, patient_id, product_id } = req.body;
     const normalizedEntryDate = normalizeDate(entry_date);
     const patientId = patient_id ? patient_id : null;
+    const productId = product_id ? product_id : null;
 
     await client.query('BEGIN');
 
     // insert into daily ledger
     const result = await client.query(
-      `INSERT INTO daily_ledger (clinic_id, entry_date, entry_type, category, description, amount, payment_method, reference_number, patient_id)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
-      [req.clinicId || null, normalizedEntryDate, entry_type, category, description, amount, payment_method, reference_number, patientId]
+      `INSERT INTO daily_ledger (clinic_id, entry_date, entry_type, category, description, amount, payment_method, reference_number, patient_id, product_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
+      [req.clinicId || null, normalizedEntryDate, entry_type, category, description, amount, payment_method, reference_number, patientId, productId]
     );
     const ledgerEntry = result.rows[0];
 
-    // If this is an income entry for a patient, also record a patient payment so patient ledger reflects it
-    if (entry_type === 'income' && patientId && Number(amount) > 0) {
+    // If this is an income entry for a patient, also record a patient payment so patient ledger reflects it.
+    // Product Sale is excluded: it's a retail sale, not a therapy fee/advance, and must never affect patient dues.
+    if (entry_type === 'income' && patientId && Number(amount) > 0 && category !== 'Product Sale') {
       await client.query(
         `INSERT INTO patient_payments (clinic_id, patient_id, visit_id, ledger_id, payment_date, amount, payment_method, reference_number, notes)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
