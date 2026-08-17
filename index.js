@@ -118,6 +118,8 @@ async function getPriorBalance(db, patientId, clinicId = null, excludeVisitId = 
   const { rows } = await db.query(
     `SELECT (SELECT COALESCE(SUM(fee_charged),0) FROM visits
               WHERE patient_id = $1${clinicSql}${visitExcl})
+          + (SELECT COALESCE(SUM(amount),0) FROM daily_ledger
+              WHERE patient_id = $1 AND category = 'Product Sale'${clinicSql})
           - (SELECT COALESCE(SUM(amount),0) FROM patient_payments
               WHERE patient_id = $1${clinicSql}${payExcl}) AS balance_due`,
     params
@@ -397,6 +399,7 @@ async function initDB() {
     ALTER TABLE patient_payments ADD COLUMN IF NOT EXISTS ledger_id INTEGER REFERENCES daily_ledger(id) ON DELETE SET NULL;
     ALTER TABLE daily_ledger ADD COLUMN IF NOT EXISTS clinic_id INTEGER REFERENCES clinic_master(id) ON DELETE CASCADE;
     ALTER TABLE daily_ledger ADD COLUMN IF NOT EXISTS product_id INTEGER REFERENCES products(id) ON DELETE SET NULL;
+    ALTER TABLE daily_ledger ADD COLUMN IF NOT EXISTS amount_paid NUMERIC(10,2);
     ALTER TABLE products ADD COLUMN IF NOT EXISTS clinic_id INTEGER REFERENCES clinic_master(id) ON DELETE CASCADE;
     ALTER TABLE appointments ADD COLUMN IF NOT EXISTS clinic_id INTEGER REFERENCES clinic_master(id) ON DELETE CASCADE;
     ALTER TABLE therapists ADD COLUMN IF NOT EXISTS clinic_id INTEGER REFERENCES clinic_master(id) ON DELETE CASCADE;
@@ -1325,7 +1328,10 @@ app.get('/api/ledger', async (req, res) => {
               l.entry_type, l.category, l.description, l.amount, l.payment_method, l.reference_number,
               l.patient_id, l.visit_id, l.created_at,
               l.product_id, pr.product_name,
-              p.first_name, p.last_name, v.fee_charged, v.amount_paid, v.therapy_type, v.therapy_types, v.session_notes
+              p.first_name, p.last_name,
+              COALESCE(v.fee_charged, CASE WHEN l.category = 'Product Sale' THEN l.amount END) AS fee_charged,
+              COALESCE(v.amount_paid, CASE WHEN l.category = 'Product Sale' THEN l.amount_paid END) AS amount_paid,
+              v.therapy_type, v.therapy_types, v.session_notes
            FROM daily_ledger l
            LEFT JOIN patients p ON l.patient_id = p.id
            LEFT JOIN visits v ON l.visit_id = v.id
@@ -1352,7 +1358,10 @@ app.get('/api/ledger/export', async (req, res) => {
               l.patient_id, l.visit_id, l.created_at,
               l.product_id, pr.product_name,
               p.first_name, p.last_name, p.patient_id as patient_code,
-              v.therapist_name, v.fee_charged, v.amount_paid, v.therapy_type, v.therapy_types, v.session_notes,
+              v.therapist_name,
+              COALESCE(v.fee_charged, CASE WHEN l.category = 'Product Sale' THEN l.amount END) AS fee_charged,
+              COALESCE(v.amount_paid, CASE WHEN l.category = 'Product Sale' THEN l.amount_paid END) AS amount_paid,
+              v.therapy_type, v.therapy_types, v.session_notes,
               cm.clinic_name
            FROM daily_ledger l
            LEFT JOIN patients p ON l.patient_id = p.id
@@ -1515,7 +1524,10 @@ app.get('/api/reports/export', async (req, res) => {
               l.patient_id, l.visit_id, l.created_at,
               l.product_id, pr.product_name,
               p.first_name, p.last_name, p.patient_id as patient_code,
-              v.therapist_name, v.fee_charged, v.amount_paid, v.therapy_type, v.therapy_types, v.session_notes,
+              v.therapist_name,
+              COALESCE(v.fee_charged, CASE WHEN l.category = 'Product Sale' THEN l.amount END) AS fee_charged,
+              COALESCE(v.amount_paid, CASE WHEN l.category = 'Product Sale' THEN l.amount_paid END) AS amount_paid,
+              v.therapy_type, v.therapy_types, v.session_notes,
               cm.clinic_name
            ${fromJoin}${where}
            ORDER BY l.entry_date DESC, l.created_at DESC`;
@@ -1557,28 +1569,32 @@ app.get('/api/reports/export', async (req, res) => {
 app.post('/api/ledger', async (req, res) => {
   const client = await pool.connect();
   try {
-    const { entry_date, entry_type, category, description, amount, payment_method, reference_number, patient_id, product_id } = req.body;
+    const { entry_date, entry_type, category, description, amount, amount_paid, payment_method, reference_number, patient_id, product_id } = req.body;
     const normalizedEntryDate = normalizeDate(entry_date);
     const patientId = patient_id ? patient_id : null;
     const productId = product_id ? product_id : null;
+    // Product Sale carries a charged/paid split (partial payment at time of sale) just like visit fees;
+    // every other category still treats the single `amount` typed as the amount paid.
+    const isProductSale = category === 'Product Sale';
+    const paidNow = isProductSale ? Number(amount_paid || 0) : Number(amount || 0);
 
     await client.query('BEGIN');
 
     // insert into daily ledger
     const result = await client.query(
-      `INSERT INTO daily_ledger (clinic_id, entry_date, entry_type, category, description, amount, payment_method, reference_number, patient_id, product_id)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
-      [req.clinicId || null, normalizedEntryDate, entry_type, category, description, amount, payment_method, reference_number, patientId, productId]
+      `INSERT INTO daily_ledger (clinic_id, entry_date, entry_type, category, description, amount, amount_paid, payment_method, reference_number, patient_id, product_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
+      [req.clinicId || null, normalizedEntryDate, entry_type, category, description, amount, isProductSale ? paidNow : amount, payment_method, reference_number, patientId, productId]
     );
     const ledgerEntry = result.rows[0];
 
-    // If this is an income entry for a patient, also record a patient payment so patient ledger reflects it.
-    // Product Sale is excluded: it's a retail sale, not a therapy fee/advance, and must never affect patient dues.
-    if (entry_type === 'income' && patientId && Number(amount) > 0 && category !== 'Product Sale') {
+    // If this is an income entry for a patient, also record a patient payment (for the amount actually
+    // collected now) so the patient's dues reflect it. Product Sale dues club with visit dues.
+    if (entry_type === 'income' && patientId && paidNow > 0) {
       await client.query(
         `INSERT INTO patient_payments (clinic_id, patient_id, visit_id, ledger_id, payment_date, amount, payment_method, reference_number, notes)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
-        [req.clinicId || null, patientId, null, ledgerEntry.id, normalizedEntryDate, amount, payment_method, reference_number, description]
+        [req.clinicId || null, patientId, null, ledgerEntry.id, normalizedEntryDate, paidNow, payment_method, reference_number, description]
       );
     }
 
@@ -1645,28 +1661,34 @@ app.get('/api/patient-ledger/:patient_id', async (req, res) => {
            SELECT COALESCE(SUM(fee_charged),0) AS total_charged,
                   COUNT(*) AS total_visits
            FROM visits WHERE patient_id = $1 AND clinic_id = $2
+         ), product_sum AS (
+           SELECT COALESCE(SUM(amount),0) AS total_charged
+           FROM daily_ledger WHERE patient_id = $1 AND category = 'Product Sale' AND clinic_id = $2
          ), payments_sum AS (
            SELECT COALESCE(SUM(amount),0) AS total_paid
            FROM patient_payments WHERE patient_id = $1 AND clinic_id = $2
          )
-         SELECT v.total_charged,
+         SELECT v.total_charged + pr.total_charged AS total_charged,
                 p.total_paid,
-                v.total_charged - p.total_paid AS balance_due,
+                (v.total_charged + pr.total_charged) - p.total_paid AS balance_due,
                 v.total_visits
-         FROM visits_sum v CROSS JOIN payments_sum p`
+         FROM visits_sum v CROSS JOIN product_sum pr CROSS JOIN payments_sum p`
         : `WITH visits_sum AS (
            SELECT COALESCE(SUM(fee_charged),0) AS total_charged,
                   COUNT(*) AS total_visits
            FROM visits WHERE patient_id = $1
+         ), product_sum AS (
+           SELECT COALESCE(SUM(amount),0) AS total_charged
+           FROM daily_ledger WHERE patient_id = $1 AND category = 'Product Sale'
          ), payments_sum AS (
            SELECT COALESCE(SUM(amount),0) AS total_paid
            FROM patient_payments WHERE patient_id = $1
          )
-         SELECT v.total_charged,
+         SELECT v.total_charged + pr.total_charged AS total_charged,
                 p.total_paid,
-                v.total_charged - p.total_paid AS balance_due,
+                (v.total_charged + pr.total_charged) - p.total_paid AS balance_due,
                 v.total_visits
-         FROM visits_sum v CROSS JOIN payments_sum p`,
+         FROM visits_sum v CROSS JOIN product_sum pr CROSS JOIN payments_sum p`,
       req.clinicId ? [req.params.patient_id, req.clinicId] : [req.params.patient_id]
     );
     // console.log(visits, payments, summary);
@@ -1764,9 +1786,9 @@ app.get('/api/patient-dues', async (req, res) => {
 
     const query = `
       SELECT p.id, p.patient_id as patient_code, p.first_name, p.last_name,
-             COALESCE(v.total_charged,0) as total_charged,
+             COALESCE(v.total_charged,0) + COALESCE(pr.total_charged,0) as total_charged,
              COALESCE(pay.total_paid,0) as total_paid,
-             COALESCE(v.total_charged,0) - COALESCE(pay.total_paid,0) as due_balance
+             COALESCE(v.total_charged,0) + COALESCE(pr.total_charged,0) - COALESCE(pay.total_paid,0) as due_balance
       FROM patients p
       LEFT JOIN (
         SELECT patient_id, SUM(fee_charged) AS total_charged
@@ -1774,6 +1796,12 @@ app.get('/api/patient-dues', async (req, res) => {
         WHERE 1=1${clinicFilter}
         GROUP BY patient_id
       ) v ON v.patient_id = p.id
+      LEFT JOIN (
+        SELECT patient_id, SUM(amount) AS total_charged
+        FROM daily_ledger
+        WHERE category = 'Product Sale'${clinicFilter}
+        GROUP BY patient_id
+      ) pr ON pr.patient_id = p.id
       LEFT JOIN (
         SELECT patient_id, SUM(amount) AS total_paid
         FROM patient_payments
@@ -1783,7 +1811,7 @@ app.get('/api/patient-dues', async (req, res) => {
       WHERE 1=1
       ${req.clinicId ? 'AND p.clinic_id = $1' : ''}
       ${patientFilter}
-      ${!patient_id ? 'AND COALESCE(v.total_charged,0) - COALESCE(pay.total_paid,0) <> 0' : ''}
+      ${!patient_id ? "AND COALESCE(v.total_charged,0) + COALESCE(pr.total_charged,0) - COALESCE(pay.total_paid,0) <> 0" : ''}
       ORDER BY due_balance DESC
     `;
 
@@ -1804,9 +1832,9 @@ app.get('/api/patient-dues/export', async (req, res) => {
 
     const query = `
       SELECT p.id, p.patient_id as patient_code, p.first_name, p.last_name, cm.clinic_name,
-             COALESCE(v.total_charged,0) as total_charged,
+             COALESCE(v.total_charged,0) + COALESCE(pr.total_charged,0) as total_charged,
              COALESCE(pay.total_paid,0) as total_paid,
-             COALESCE(v.total_charged,0) - COALESCE(pay.total_paid,0) as due_balance
+             COALESCE(v.total_charged,0) + COALESCE(pr.total_charged,0) - COALESCE(pay.total_paid,0) as due_balance
       FROM patients p
       LEFT JOIN clinic_master cm ON p.clinic_id = cm.id
       LEFT JOIN (
@@ -1816,6 +1844,12 @@ app.get('/api/patient-dues/export', async (req, res) => {
         GROUP BY patient_id
       ) v ON v.patient_id = p.id
       LEFT JOIN (
+        SELECT patient_id, SUM(amount) AS total_charged
+        FROM daily_ledger
+        WHERE category = 'Product Sale'${clinicFilter}
+        GROUP BY patient_id
+      ) pr ON pr.patient_id = p.id
+      LEFT JOIN (
         SELECT patient_id, SUM(amount) AS total_paid
         FROM patient_payments
         WHERE 1=1${clinicFilter}
@@ -1824,7 +1858,7 @@ app.get('/api/patient-dues/export', async (req, res) => {
       WHERE 1=1
       ${req.clinicId ? 'AND p.clinic_id = $1' : ''}
       ${patientFilter}
-      ${!patient_id ? 'AND COALESCE(v.total_charged,0) - COALESCE(pay.total_paid,0) <> 0' : ''}
+      ${!patient_id ? "AND COALESCE(v.total_charged,0) + COALESCE(pr.total_charged,0) - COALESCE(pay.total_paid,0) <> 0" : ''}
       ORDER BY due_balance DESC
     `;
 
@@ -1859,9 +1893,11 @@ app.get('/api/dashboard', async (req, res) => {
       // Clamped per patient: an advance credit must not cancel out other patients' genuine dues.
       pool.query(req.clinicId ? `SELECT COALESCE(SUM(GREATEST(bal,0)),0) as total FROM (
                     SELECT COALESCE((SELECT SUM(fee_charged) FROM visits v WHERE v.patient_id = p.id AND v.clinic_id = $1),0)
+                         + COALESCE((SELECT SUM(amount) FROM daily_ledger dl WHERE dl.patient_id = p.id AND dl.category = 'Product Sale' AND dl.clinic_id = $1),0)
                          - COALESCE((SELECT SUM(amount) FROM patient_payments pp WHERE pp.patient_id = p.id AND pp.clinic_id = $1),0) AS bal
                     FROM patients p WHERE p.clinic_id = $1) t` : `SELECT COALESCE(SUM(GREATEST(bal,0)),0) as total FROM (
                     SELECT COALESCE((SELECT SUM(fee_charged) FROM visits v WHERE v.patient_id = p.id),0)
+                         + COALESCE((SELECT SUM(amount) FROM daily_ledger dl WHERE dl.patient_id = p.id AND dl.category = 'Product Sale'),0)
                          - COALESCE((SELECT SUM(amount) FROM patient_payments pp WHERE pp.patient_id = p.id),0) AS bal
                     FROM patients p) t`, [ ...(req.clinicId ? [req.clinicId] : []) ]),
       pool.query(req.clinicId ? `SELECT v.*, p.first_name, p.last_name, p.patient_id as pid FROM visits v 
