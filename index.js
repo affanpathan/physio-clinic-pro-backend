@@ -196,6 +196,11 @@ async function resolveProductName(productId) {
   return rows[0]?.product_name || 'Unknown Product';
 }
 
+async function resolveBankName(bankId) {
+  const { rows } = await pool.query('SELECT bank_name FROM banks WHERE id = $1', [bankId]);
+  return rows[0]?.bank_name || 'Unknown Bank';
+}
+
 // Turns a patient_id filter param into a readable "Name (Code)" label for the export's
 // Filters line. Reads the name/code off an already-fetched row when available (sampleRow) to
 // avoid an extra query; only falls back to a lookup when the filtered result set was empty.
@@ -352,6 +357,15 @@ async function initDB() {
       updated_at TIMESTAMP DEFAULT NOW()
     );
 
+    CREATE TABLE IF NOT EXISTS banks (
+      id SERIAL PRIMARY KEY,
+      clinic_id INTEGER REFERENCES clinic_master(id) ON DELETE CASCADE,
+      bank_name VARCHAR(200) NOT NULL,
+      active BOOLEAN DEFAULT TRUE,
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+
     CREATE TABLE IF NOT EXISTS clinic_master (
       id SERIAL PRIMARY KEY,
       clinic_name VARCHAR(200) NOT NULL,
@@ -405,6 +419,9 @@ async function initDB() {
     ALTER TABLE therapists ADD COLUMN IF NOT EXISTS clinic_id INTEGER REFERENCES clinic_master(id) ON DELETE CASCADE;
     ALTER TABLE clinic_master ADD COLUMN IF NOT EXISTS currency VARCHAR(10) DEFAULT 'INR';
     ALTER TABLE clinic_master ADD COLUMN IF NOT EXISTS currency_symbol VARCHAR(10) DEFAULT '₹';
+    ALTER TABLE visits ADD COLUMN IF NOT EXISTS bank_id INTEGER REFERENCES banks(id) ON DELETE SET NULL;
+    ALTER TABLE patient_payments ADD COLUMN IF NOT EXISTS bank_id INTEGER REFERENCES banks(id) ON DELETE SET NULL;
+    ALTER TABLE daily_ledger ADD COLUMN IF NOT EXISTS bank_id INTEGER REFERENCES banks(id) ON DELETE SET NULL;
 
     CREATE INDEX IF NOT EXISTS idx_visits_patient ON visits(patient_id);
     CREATE INDEX IF NOT EXISTS idx_therapists_clinic ON therapists(clinic_id);
@@ -421,6 +438,7 @@ async function initDB() {
     CREATE INDEX IF NOT EXISTS idx_appointments_date ON appointments(appointment_date);
     CREATE INDEX IF NOT EXISTS idx_products_clinic ON products(clinic_id);
     CREATE INDEX IF NOT EXISTS idx_ledger_product ON daily_ledger(product_id);
+    CREATE INDEX IF NOT EXISTS idx_banks_clinic ON banks(clinic_id);
   `);
   console.log('Database initialized');
 }
@@ -956,6 +974,112 @@ app.delete('/api/products/:id', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ---- BANKS ----
+app.get('/api/banks', async (req, res) => {
+  try {
+    const conditions = [];
+    const params = [];
+    if (req.clinicId) { params.push(req.clinicId); conditions.push(`b.clinic_id = $${params.length}`); }
+    if (req.query.active === 'true' || req.query.active === 'false') {
+      params.push(req.query.active === 'true');
+      conditions.push(`b.active = $${params.length}`);
+    }
+    const where = conditions.length ? ` WHERE ${conditions.join(' AND ')}` : '';
+    const query = `SELECT b.*, cm.clinic_name FROM banks b LEFT JOIN clinic_master cm ON b.clinic_id = cm.id${where} ORDER BY b.bank_name ASC`;
+    const result = await pool.query(query, params);
+    res.json(result.rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/banks/export', async (req, res) => {
+  try {
+    const query = req.clinicId
+      ? `SELECT b.*, cm.clinic_name FROM banks b LEFT JOIN clinic_master cm ON b.clinic_id = cm.id WHERE b.clinic_id = $1 ORDER BY b.bank_name ASC`
+      : `SELECT b.*, cm.clinic_name FROM banks b LEFT JOIN clinic_master cm ON b.clinic_id = cm.id ORDER BY b.bank_name ASC`;
+    const params = req.clinicId ? [req.clinicId] : [];
+    const result = await pool.query(query, params);
+    const clinicName = await resolveClinicName(req.clinicId);
+    const columns = [
+      { label: 'Bank Name', value: r => r.bank_name },
+      { label: 'Active', value: r => r.active ? 'Yes' : 'No' },
+      { label: 'Created At', value: r => formatTimestamp(r.created_at) },
+      { label: 'Updated At', value: r => formatTimestamp(r.updated_at) },
+    ];
+    if (!req.clinicId) columns.push({ label: 'Clinic Name', value: r => r.clinic_name });
+    sendCsv(res, { module: 'Banks', clinicName, dateRangeLabel: null, filterLabels: [], columns, rows: result.rows, filenamePrefix: 'banks' });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/banks/:id', async (req, res) => {
+  try {
+    const query = req.clinicId
+      ? `SELECT b.*, cm.clinic_name FROM banks b LEFT JOIN clinic_master cm ON b.clinic_id = cm.id WHERE b.id = $1 AND b.clinic_id = $2`
+      : `SELECT b.*, cm.clinic_name FROM banks b LEFT JOIN clinic_master cm ON b.clinic_id = cm.id WHERE b.id = $1`;
+    const params = req.clinicId ? [req.params.id, req.clinicId] : [req.params.id];
+    const result = await pool.query(query, params);
+    if (!result.rows.length) return res.status(404).json({ error: 'Not found' });
+    res.json(result.rows[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/banks', async (req, res) => {
+  try {
+    const { clinic_id, bank_name, active } = req.body;
+    if (!bank_name || !bank_name.trim()) {
+      return res.status(400).json({ error: 'Bank name is required.' });
+    }
+    const targetClinicId = clinic_id || req.clinicId || null;
+    const result = await pool.query(
+      `INSERT INTO banks (clinic_id, bank_name, active)
+       VALUES ($1, $2, $3) RETURNING *`,
+      [targetClinicId, bank_name.trim(), active !== undefined ? active : true]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.put('/api/banks/:id', async (req, res) => {
+  try {
+    const { clinic_id, bank_name, active } = req.body;
+    if (!bank_name || !bank_name.trim()) {
+      return res.status(400).json({ error: 'Bank name is required.' });
+    }
+    const targetClinicId = clinic_id || req.clinicId || null;
+    const clinicFilter = req.clinicId && !req.isAdmin ? ' AND clinic_id = $5' : '';
+    const query = req.clinicId && !req.isAdmin
+      ? `UPDATE banks SET clinic_id = $1, bank_name = $2, active = $3, updated_at = NOW() WHERE id = $4${clinicFilter} RETURNING *`
+      : `UPDATE banks SET clinic_id = $1, bank_name = $2, active = $3, updated_at = NOW() WHERE id = $4 RETURNING *`;
+    const params = req.clinicId && !req.isAdmin
+      ? [targetClinicId, bank_name.trim(), active !== undefined ? active : true, req.params.id, req.clinicId]
+      : [targetClinicId, bank_name.trim(), active !== undefined ? active : true, req.params.id];
+    const result = await pool.query(query, params);
+    if (!result.rows.length) return res.status(404).json({ error: 'Not found' });
+    res.json(result.rows[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete('/api/banks/:id', async (req, res) => {
+  try {
+    const checkQuery = req.clinicId
+      ? `SELECT 1 FROM visits WHERE bank_id = $1 AND clinic_id = $2
+         UNION SELECT 1 FROM patient_payments WHERE bank_id = $1 AND clinic_id = $2
+         UNION SELECT 1 FROM daily_ledger WHERE bank_id = $1 AND clinic_id = $2 LIMIT 1`
+      : `SELECT 1 FROM visits WHERE bank_id = $1
+         UNION SELECT 1 FROM patient_payments WHERE bank_id = $1
+         UNION SELECT 1 FROM daily_ledger WHERE bank_id = $1 LIMIT 1`;
+    const checkParams = req.clinicId ? [req.params.id, req.clinicId] : [req.params.id];
+    const inUse = await pool.query(checkQuery, checkParams);
+    if (inUse.rows.length) {
+      return res.status(409).json({ error: 'This bank has payments recorded against it and cannot be deleted. Mark it inactive instead.' });
+    }
+    const query = req.clinicId ? 'DELETE FROM banks WHERE id = $1 AND clinic_id = $2 RETURNING id' : 'DELETE FROM banks WHERE id = $1 RETURNING id';
+    const params = req.clinicId ? [req.params.id, req.clinicId] : [req.params.id];
+    const result = await pool.query(query, params);
+    if (!result.rows.length) return res.status(404).json({ error: 'Not found' });
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // ---- PATIENTS ----
 app.get('/api/patients', async (req, res) => {
   try {
@@ -1069,8 +1193,9 @@ app.put('/api/patients/:id', async (req, res) => {
 app.get('/api/visits', async (req, res) => {
   try {
     const { patient_id, date_from, date_to, date } = req.query;
-    let query = `SELECT v.*, p.first_name, p.last_name, p.patient_id as pid 
-                 FROM visits v JOIN patients p ON v.patient_id = p.id WHERE 1=1`;
+    let query = `SELECT v.*, p.first_name, p.last_name, p.patient_id as pid, bk.bank_name
+                 FROM visits v JOIN patients p ON v.patient_id = p.id
+                 LEFT JOIN banks bk ON v.bank_id = bk.id WHERE 1=1`;
     const params = [];
     if (req.clinicId) {
       params.push(req.clinicId);
@@ -1089,9 +1214,10 @@ app.get('/api/visits', async (req, res) => {
 app.get('/api/visits/export', async (req, res) => {
   try {
     const { patient_id, date_from, date_to, date } = req.query;
-    let query = `SELECT v.*, p.first_name, p.last_name, p.patient_id as pid, cm.clinic_name
+    let query = `SELECT v.*, p.first_name, p.last_name, p.patient_id as pid, cm.clinic_name, bk.bank_name
                  FROM visits v JOIN patients p ON v.patient_id = p.id
-                 LEFT JOIN clinic_master cm ON v.clinic_id = cm.id WHERE 1=1`;
+                 LEFT JOIN clinic_master cm ON v.clinic_id = cm.id
+                 LEFT JOIN banks bk ON v.bank_id = bk.id WHERE 1=1`;
     const params = [];
     if (req.clinicId) { params.push(req.clinicId); query += ` AND v.clinic_id = $${params.length}`; }
     if (patient_id) { params.push(patient_id); query += ` AND v.patient_id = $${params.length}`; }
@@ -1116,6 +1242,7 @@ app.get('/api/visits/export', async (req, res) => {
       { label: 'Fee Charged', value: r => r.fee_charged },
       { label: 'Amount Paid', value: r => r.amount_paid },
       { label: 'Payment Method', value: r => r.payment_method },
+      { label: 'Bank', value: r => r.bank_name },
       { label: 'Payment Status', value: r => r.payment_status },
       { label: 'Chief Complaint', value: r => r.chief_complaint },
       { label: 'Treatment Given', value: r => r.treatment_given },
@@ -1134,7 +1261,7 @@ app.post('/api/visits', async (req, res) => {
     // payment_status is intentionally not read from the body — it is derived below from the
     // patient's carried-forward balance, which the client cannot see.
     const { patient_id, therapy_plan_id, visit_date, visit_time, therapist_name, therapies,
-            fee_charged, amount_paid, payment_method, session_notes,
+            fee_charged, amount_paid, payment_method, bank_id, session_notes,
             chief_complaint, treatment_given } = req.body;
 
     const { therapies: normalizedTherapies, error: therapiesError } = normalizeTherapies(therapies);
@@ -1145,6 +1272,7 @@ app.post('/api/visits', async (req, res) => {
     const normalizedVisitDate = normalizeDate(visit_date);
     const legacyTherapyType = normalizedTherapies[0].therapy_type;
     const totalDuration = normalizedTherapies.reduce((s, t) => s + t.duration_minutes, 0);
+    const resolvedBankId = payment_method === 'online' ? (bank_id || null) : null;
 
     await client.query('BEGIN');
 
@@ -1154,23 +1282,23 @@ app.post('/api/visits', async (req, res) => {
 
     const visitResult = await client.query(
       `INSERT INTO visits (clinic_id, patient_id, therapy_plan_id, visit_date, visit_time, therapist_name, therapy_type, therapy_types,
-        duration_minutes, fee_charged, amount_paid, payment_method, payment_status, session_notes, chief_complaint, treatment_given)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING *`,
+        duration_minutes, fee_charged, amount_paid, payment_method, bank_id, payment_status, session_notes, chief_complaint, treatment_given)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11,$12,$13,$14,$15,$16,$17) RETURNING *`,
       [req.clinicId || null, patient_id, therapy_plan_id || null, normalizedVisitDate, visit_time, therapist_name, legacyTherapyType,
-       JSON.stringify(normalizedTherapies), totalDuration, fee_charged || 0, amount_paid || 0, payment_method, resolvedStatus, session_notes, chief_complaint, treatment_given]
+       JSON.stringify(normalizedTherapies), totalDuration, fee_charged || 0, amount_paid || 0, payment_method, resolvedBankId, resolvedStatus, session_notes, chief_complaint, treatment_given]
     );
     const visit = visitResult.rows[0];
 
     if (amount_paid > 0) {
       await client.query(
-        `INSERT INTO patient_payments (clinic_id, patient_id, visit_id, payment_date, amount, payment_method, notes)
-         VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-        [req.clinicId || null, patient_id, visit.id, normalizedVisitDate, amount_paid, payment_method, `Visit payment - ${normalizedVisitDate}`]
+        `INSERT INTO patient_payments (clinic_id, patient_id, visit_id, payment_date, amount, payment_method, bank_id, notes)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+        [req.clinicId || null, patient_id, visit.id, normalizedVisitDate, amount_paid, payment_method, resolvedBankId, `Visit payment - ${normalizedVisitDate}`]
       );
       await client.query(
-        `INSERT INTO daily_ledger (clinic_id, entry_date, entry_type, category, description, amount, payment_method, patient_id, visit_id)
-         VALUES ($1,$2,'income','Therapy Fee',$3,$4,$5,$6,$7)`,
-        [req.clinicId || null, normalizedVisitDate, `Therapy fee - ${legacyTherapyType}`, amount_paid, payment_method, patient_id, visit.id]
+        `INSERT INTO daily_ledger (clinic_id, entry_date, entry_type, category, description, amount, payment_method, bank_id, patient_id, visit_id)
+         VALUES ($1,$2,'income','Therapy Fee',$3,$4,$5,$6,$7,$8)`,
+        [req.clinicId || null, normalizedVisitDate, `Therapy fee - ${legacyTherapyType}`, amount_paid, payment_method, resolvedBankId, patient_id, visit.id]
       );
     }
     await client.query('COMMIT');
@@ -1197,7 +1325,7 @@ app.put('/api/visits/:id', async (req, res) => {
   try {
     // payment_status is derived server-side (see POST /api/visits) and ignored if sent.
     const { visit_date, visit_time, therapist_name, therapies, fee_charged,
-            amount_paid, payment_method, session_notes, chief_complaint, treatment_given } = req.body;
+            amount_paid, payment_method, bank_id, session_notes, chief_complaint, treatment_given } = req.body;
 
     const { therapies: normalizedTherapies, error: therapiesError } = normalizeTherapies(therapies);
     if (therapiesError) return res.status(400).json({ error: therapiesError });
@@ -1207,6 +1335,7 @@ app.put('/api/visits/:id', async (req, res) => {
     const normalizedVisitDate = normalizeDate(visit_date);
     const legacyTherapyType = normalizedTherapies[0].therapy_type;
     const totalDuration = normalizedTherapies.reduce((s, t) => s + t.duration_minutes, 0);
+    const resolvedBankId = payment_method === 'online' ? (bank_id || null) : null;
 
     await client.query('BEGIN');
 
@@ -1232,16 +1361,16 @@ app.put('/api/visits/:id', async (req, res) => {
     const result = await client.query(
       req.clinicId
         ? `UPDATE visits SET visit_date=$1, visit_time=$2, therapist_name=$3, therapy_type=$4, therapy_types=$5::jsonb, duration_minutes=$6,
-           fee_charged=$7, amount_paid=$8, payment_method=$9, payment_status=$10, session_notes=$11,
-           chief_complaint=$12, treatment_given=$13 WHERE id=$14 AND clinic_id=$15 RETURNING *`
+           fee_charged=$7, amount_paid=$8, payment_method=$9, bank_id=$10, payment_status=$11, session_notes=$12,
+           chief_complaint=$13, treatment_given=$14 WHERE id=$15 AND clinic_id=$16 RETURNING *`
         : `UPDATE visits SET visit_date=$1, visit_time=$2, therapist_name=$3, therapy_type=$4, therapy_types=$5::jsonb, duration_minutes=$6,
-           fee_charged=$7, amount_paid=$8, payment_method=$9, payment_status=$10, session_notes=$11,
-           chief_complaint=$12, treatment_given=$13 WHERE id=$14 RETURNING *`,
+           fee_charged=$7, amount_paid=$8, payment_method=$9, bank_id=$10, payment_status=$11, session_notes=$12,
+           chief_complaint=$13, treatment_given=$14 WHERE id=$15 RETURNING *`,
       req.clinicId
         ? [normalizedVisitDate, visit_time, therapist_name, legacyTherapyType, JSON.stringify(normalizedTherapies), totalDuration, fee_charged || 0,
-           amount_paid || 0, payment_method, resolvedStatus, session_notes, chief_complaint, treatment_given, req.params.id, req.clinicId]
+           amount_paid || 0, payment_method, resolvedBankId, resolvedStatus, session_notes, chief_complaint, treatment_given, req.params.id, req.clinicId]
         : [normalizedVisitDate, visit_time, therapist_name, legacyTherapyType, JSON.stringify(normalizedTherapies), totalDuration, fee_charged || 0,
-           amount_paid || 0, payment_method, resolvedStatus, session_notes, chief_complaint, treatment_given, req.params.id]
+           amount_paid || 0, payment_method, resolvedBankId, resolvedStatus, session_notes, chief_complaint, treatment_given, req.params.id]
     );
     if (!result.rows.length) {
       await client.query('ROLLBACK');
@@ -1254,14 +1383,14 @@ app.put('/api/visits/:id', async (req, res) => {
     await client.query('DELETE FROM daily_ledger WHERE visit_id=$1', [req.params.id]);
     if (amount_paid > 0) {
       await client.query(
-        `INSERT INTO patient_payments (clinic_id, patient_id, visit_id, payment_date, amount, payment_method, notes)
-         VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-        [req.clinicId || null, visit.patient_id, visit.id, normalizedVisitDate, amount_paid, payment_method, `Visit payment - ${normalizedVisitDate}`]
+        `INSERT INTO patient_payments (clinic_id, patient_id, visit_id, payment_date, amount, payment_method, bank_id, notes)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+        [req.clinicId || null, visit.patient_id, visit.id, normalizedVisitDate, amount_paid, payment_method, resolvedBankId, `Visit payment - ${normalizedVisitDate}`]
       );
       await client.query(
-        `INSERT INTO daily_ledger (clinic_id, entry_date, entry_type, category, description, amount, payment_method, patient_id, visit_id)
-         VALUES ($1,$2,'income','Therapy Fee',$3,$4,$5,$6,$7)`,
-        [req.clinicId || null, normalizedVisitDate, `Therapy fee - ${legacyTherapyType}`, amount_paid, payment_method, visit.patient_id, visit.id]
+        `INSERT INTO daily_ledger (clinic_id, entry_date, entry_type, category, description, amount, payment_method, bank_id, patient_id, visit_id)
+         VALUES ($1,$2,'income','Therapy Fee',$3,$4,$5,$6,$7,$8)`,
+        [req.clinicId || null, normalizedVisitDate, `Therapy fee - ${legacyTherapyType}`, amount_paid, payment_method, resolvedBankId, visit.patient_id, visit.id]
       );
     }
 
@@ -1325,7 +1454,7 @@ app.get('/api/ledger', async (req, res) => {
     const { date, date_from, date_to } = req.query;
     let query = `SELECT l.id,
               to_char(l.entry_date,'YYYY-MM-DD') AS entry_date,
-              l.entry_type, l.category, l.description, l.amount, l.payment_method, l.reference_number,
+              l.entry_type, l.category, l.description, l.amount, l.payment_method, l.bank_id, bk.bank_name, l.reference_number,
               l.patient_id, l.visit_id, l.created_at,
               l.product_id, pr.product_name,
               p.first_name, p.last_name,
@@ -1336,6 +1465,7 @@ app.get('/api/ledger', async (req, res) => {
            LEFT JOIN patients p ON l.patient_id = p.id
            LEFT JOIN visits v ON l.visit_id = v.id
            LEFT JOIN products pr ON l.product_id = pr.id
+           LEFT JOIN banks bk ON l.bank_id = bk.id
            WHERE 1=1`;
     const params = [];
     if (req.clinicId) { params.push(req.clinicId); query += ` AND l.clinic_id = $${params.length}`; }
@@ -1354,7 +1484,7 @@ app.get('/api/ledger/export', async (req, res) => {
     const { date, date_from, date_to, entry_type } = req.query;
     let query = `SELECT l.id,
               to_char(l.entry_date,'YYYY-MM-DD') AS entry_date,
-              l.entry_type, l.category, l.description, l.amount, l.payment_method, l.reference_number,
+              l.entry_type, l.category, l.description, l.amount, l.payment_method, l.bank_id, bk.bank_name, l.reference_number,
               l.patient_id, l.visit_id, l.created_at,
               l.product_id, pr.product_name,
               p.first_name, p.last_name, p.patient_id as patient_code,
@@ -1368,6 +1498,7 @@ app.get('/api/ledger/export', async (req, res) => {
            LEFT JOIN visits v ON l.visit_id = v.id
            LEFT JOIN clinic_master cm ON l.clinic_id = cm.id
            LEFT JOIN products pr ON l.product_id = pr.id
+           LEFT JOIN banks bk ON l.bank_id = bk.id
            WHERE 1=1`;
     const params = [];
     if (req.clinicId) { params.push(req.clinicId); query += ` AND l.clinic_id = $${params.length}`; }
@@ -1389,6 +1520,7 @@ app.get('/api/ledger/export', async (req, res) => {
       { label: 'Description', value: r => r.description },
       { label: 'Amount', value: r => r.amount },
       { label: 'Payment Method', value: r => r.payment_method },
+      { label: 'Bank', value: r => r.bank_name },
       { label: 'Reference Number', value: r => r.reference_number },
       { label: 'Patient Code', value: r => r.patient_code },
       { label: 'Patient Name', value: r => r.first_name ? `${r.first_name} ${r.last_name}` : '' },
@@ -1408,7 +1540,7 @@ const REPORTS_PAGE_SIZES = [25, 50, 75, 100];
 
 app.get('/api/reports', async (req, res) => {
   try {
-    const { date_from, date_to, entry_type, category, exclude_category, therapist_name, patient_id, payment_method, product_id } = req.query;
+    const { date_from, date_to, entry_type, category, exclude_category, therapist_name, patient_id, payment_method, bank_id, product_id } = req.query;
     if (!date_from || !date_to) {
       return res.status(400).json({ error: 'date_from and date_to are required' });
     }
@@ -1435,12 +1567,14 @@ app.get('/api/reports', async (req, res) => {
     if (patient_id === 'all') { where += ' AND l.patient_id IS NOT NULL'; }
     else if (patient_id) { whereParams.push(patient_id); where += ` AND l.patient_id = $${whereParams.length}`; }
     if (payment_method) { whereParams.push(payment_method); where += ` AND l.payment_method = $${whereParams.length}`; }
+    if (bank_id) { whereParams.push(bank_id); where += ` AND l.bank_id = $${whereParams.length}`; }
     if (product_id) { whereParams.push(product_id); where += ` AND l.product_id = $${whereParams.length}`; }
 
     const fromJoin = ` FROM daily_ledger l
            LEFT JOIN patients p ON l.patient_id = p.id
            LEFT JOIN visits v ON l.visit_id = v.id
-           LEFT JOIN products pr ON l.product_id = pr.id`;
+           LEFT JOIN products pr ON l.product_id = pr.id
+           LEFT JOIN banks bk ON l.bank_id = bk.id`;
 
     const summaryResult = await pool.query(
       `SELECT COUNT(*) AS total,
@@ -1456,10 +1590,26 @@ app.get('/api/reports', async (req, res) => {
     const totalIncome = Number(summaryRow.total_income);
     const totalExpense = Number(summaryRow.total_expense);
 
+    const byBankResult = await pool.query(
+      `SELECT bk.id AS bank_id, bk.bank_name,
+              COALESCE(SUM(CASE WHEN l.entry_type = 'income' THEN l.amount ELSE 0 END), 0) AS income,
+              COALESCE(SUM(CASE WHEN l.entry_type = 'expense' THEN l.amount ELSE 0 END), 0) AS expense
+       ${fromJoin}${where} AND l.bank_id IS NOT NULL
+       GROUP BY bk.id, bk.bank_name
+       ORDER BY bk.bank_name ASC`,
+      whereParams
+    );
+    const byBank = byBankResult.rows.map(r => ({
+      bankId: r.bank_id,
+      bankName: r.bank_name,
+      income: Number(r.income),
+      expense: Number(r.expense),
+    }));
+
     const dataParams = [...whereParams, pageSize, (page - 1) * pageSize];
     const dataQuery = `SELECT l.id,
               to_char(l.entry_date,'YYYY-MM-DD') AS entry_date,
-              l.entry_type, l.category, l.description, l.amount, l.payment_method, l.reference_number,
+              l.entry_type, l.category, l.description, l.amount, l.payment_method, l.bank_id, bk.bank_name, l.reference_number,
               l.patient_id, l.visit_id, l.created_at,
               l.product_id, pr.product_name,
               p.first_name, p.last_name, v.therapist_name, v.session_notes
@@ -1480,6 +1630,7 @@ app.get('/api/reports', async (req, res) => {
         grandTotal: totalIncome - totalExpense,
         cashAmount: Number(summaryRow.cash_amount),
         onlineAmount: Number(summaryRow.online_amount),
+        byBank,
       },
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -1487,7 +1638,7 @@ app.get('/api/reports', async (req, res) => {
 
 app.get('/api/reports/export', async (req, res) => {
   try {
-    const { date_from, date_to, entry_type, category, exclude_category, therapist_name, patient_id, payment_method, product_id } = req.query;
+    const { date_from, date_to, entry_type, category, exclude_category, therapist_name, patient_id, payment_method, bank_id, product_id } = req.query;
     if (!date_from || !date_to) {
       return res.status(400).json({ error: 'date_from and date_to are required' });
     }
@@ -1510,17 +1661,19 @@ app.get('/api/reports/export', async (req, res) => {
     if (patient_id === 'all') { where += ' AND l.patient_id IS NOT NULL'; }
     else if (patient_id) { whereParams.push(patient_id); where += ` AND l.patient_id = $${whereParams.length}`; }
     if (payment_method) { whereParams.push(payment_method); where += ` AND l.payment_method = $${whereParams.length}`; }
+    if (bank_id) { whereParams.push(bank_id); where += ` AND l.bank_id = $${whereParams.length}`; }
     if (product_id) { whereParams.push(product_id); where += ` AND l.product_id = $${whereParams.length}`; }
 
     const fromJoin = ` FROM daily_ledger l
            LEFT JOIN patients p ON l.patient_id = p.id
            LEFT JOIN visits v ON l.visit_id = v.id
            LEFT JOIN clinic_master cm ON l.clinic_id = cm.id
-           LEFT JOIN products pr ON l.product_id = pr.id`;
+           LEFT JOIN products pr ON l.product_id = pr.id
+           LEFT JOIN banks bk ON l.bank_id = bk.id`;
 
     const dataQuery = `SELECT l.id,
               to_char(l.entry_date,'YYYY-MM-DD') AS entry_date,
-              l.entry_type, l.category, l.description, l.amount, l.payment_method, l.reference_number,
+              l.entry_type, l.category, l.description, l.amount, l.payment_method, l.bank_id, bk.bank_name, l.reference_number,
               l.patient_id, l.visit_id, l.created_at,
               l.product_id, pr.product_name,
               p.first_name, p.last_name, p.patient_id as patient_code,
@@ -1542,6 +1695,7 @@ app.get('/api/reports/export', async (req, res) => {
     if (patient_id === 'all') filterLabels.push('Patient=All');
     else if (patient_id) filterLabels.push(`Patient=${await describePatientFilter(patient_id, req.clinicId, result.rows[0])}`);
     if (payment_method) filterLabels.push(`Payment Method=${payment_method === 'cash' ? 'Cash' : 'Online / UPI'}`);
+    if (bank_id) filterLabels.push(`Bank=${await resolveBankName(bank_id)}`);
     if (product_id) filterLabels.push(`Product=${await resolveProductName(product_id)}`);
 
     const columns = [
@@ -1556,6 +1710,7 @@ app.get('/api/reports/export', async (req, res) => {
       { label: 'Fee Charged', value: r => r.fee_charged },
       { label: 'Amount Paid', value: r => r.amount_paid },
       { label: 'Payment Method', value: r => r.payment_method },
+      { label: 'Bank', value: r => r.bank_name },
       { label: 'Amount', value: r => r.amount },
       { label: 'Reference Number', value: r => r.reference_number },
       { label: 'Session Notes', value: r => r.session_notes },
@@ -1569,10 +1724,11 @@ app.get('/api/reports/export', async (req, res) => {
 app.post('/api/ledger', async (req, res) => {
   const client = await pool.connect();
   try {
-    const { entry_date, entry_type, category, description, amount, amount_paid, payment_method, reference_number, patient_id, product_id } = req.body;
+    const { entry_date, entry_type, category, description, amount, amount_paid, payment_method, bank_id, reference_number, patient_id, product_id } = req.body;
     const normalizedEntryDate = normalizeDate(entry_date);
     const patientId = patient_id ? patient_id : null;
     const productId = product_id ? product_id : null;
+    const resolvedBankId = payment_method === 'online' ? (bank_id || null) : null;
     // Product Sale carries a charged/paid split (partial payment at time of sale) just like visit fees;
     // every other category still treats the single `amount` typed as the amount paid.
     const isProductSale = category === 'Product Sale';
@@ -1582,9 +1738,9 @@ app.post('/api/ledger', async (req, res) => {
 
     // insert into daily ledger
     const result = await client.query(
-      `INSERT INTO daily_ledger (clinic_id, entry_date, entry_type, category, description, amount, amount_paid, payment_method, reference_number, patient_id, product_id)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
-      [req.clinicId || null, normalizedEntryDate, entry_type, category, description, amount, isProductSale ? paidNow : amount, payment_method, reference_number, patientId, productId]
+      `INSERT INTO daily_ledger (clinic_id, entry_date, entry_type, category, description, amount, amount_paid, payment_method, bank_id, reference_number, patient_id, product_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`,
+      [req.clinicId || null, normalizedEntryDate, entry_type, category, description, amount, isProductSale ? paidNow : amount, payment_method, resolvedBankId, reference_number, patientId, productId]
     );
     const ledgerEntry = result.rows[0];
 
@@ -1592,9 +1748,9 @@ app.post('/api/ledger', async (req, res) => {
     // collected now) so the patient's dues reflect it. Product Sale dues club with visit dues.
     if (entry_type === 'income' && patientId && paidNow > 0) {
       await client.query(
-        `INSERT INTO patient_payments (clinic_id, patient_id, visit_id, ledger_id, payment_date, amount, payment_method, reference_number, notes)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
-        [req.clinicId || null, patientId, null, ledgerEntry.id, normalizedEntryDate, paidNow, payment_method, reference_number, description]
+        `INSERT INTO patient_payments (clinic_id, patient_id, visit_id, ledger_id, payment_date, amount, payment_method, bank_id, reference_number, notes)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+        [req.clinicId || null, patientId, null, ledgerEntry.id, normalizedEntryDate, paidNow, payment_method, resolvedBankId, reference_number, description]
       );
     }
 
