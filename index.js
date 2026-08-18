@@ -366,6 +366,17 @@ async function initDB() {
       updated_at TIMESTAMP DEFAULT NOW()
     );
 
+    CREATE TABLE IF NOT EXISTS bank_transfers (
+      id SERIAL PRIMARY KEY,
+      clinic_id INTEGER REFERENCES clinic_master(id) ON DELETE CASCADE,
+      from_bank_id INTEGER REFERENCES banks(id) ON DELETE RESTRICT,
+      to_bank_id INTEGER REFERENCES banks(id) ON DELETE RESTRICT,
+      transfer_date DATE NOT NULL,
+      amount NUMERIC(10,2) NOT NULL,
+      description TEXT,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+
     CREATE TABLE IF NOT EXISTS clinic_master (
       id SERIAL PRIMARY KEY,
       clinic_name VARCHAR(200) NOT NULL,
@@ -439,6 +450,7 @@ async function initDB() {
     CREATE INDEX IF NOT EXISTS idx_products_clinic ON products(clinic_id);
     CREATE INDEX IF NOT EXISTS idx_ledger_product ON daily_ledger(product_id);
     CREATE INDEX IF NOT EXISTS idx_banks_clinic ON banks(clinic_id);
+    CREATE INDEX IF NOT EXISTS idx_bank_transfers_clinic ON bank_transfers(clinic_id);
   `);
   console.log('Database initialized');
 }
@@ -985,7 +997,23 @@ app.get('/api/banks', async (req, res) => {
       conditions.push(`b.active = $${params.length}`);
     }
     const where = conditions.length ? ` WHERE ${conditions.join(' AND ')}` : '';
-    const query = `SELECT b.*, cm.clinic_name FROM banks b LEFT JOIN clinic_master cm ON b.clinic_id = cm.id${where} ORDER BY b.bank_name ASC`;
+    const withBalance = req.query.with_balance === 'true';
+    const balanceSelect = withBalance
+      ? `, COALESCE(dl.online_net, 0) + COALESCE(ti.total_in, 0) - COALESCE(tout.total_out, 0) AS balance`
+      : '';
+    const balanceJoins = withBalance
+      ? `LEFT JOIN (
+           SELECT bank_id, SUM(CASE WHEN entry_type = 'income' THEN amount ELSE -amount END) AS online_net
+           FROM daily_ledger WHERE bank_id IS NOT NULL GROUP BY bank_id
+         ) dl ON dl.bank_id = b.id
+         LEFT JOIN (
+           SELECT to_bank_id AS bank_id, SUM(amount) AS total_in FROM bank_transfers GROUP BY to_bank_id
+         ) ti ON ti.bank_id = b.id
+         LEFT JOIN (
+           SELECT from_bank_id AS bank_id, SUM(amount) AS total_out FROM bank_transfers GROUP BY from_bank_id
+         ) tout ON tout.bank_id = b.id `
+      : '';
+    const query = `SELECT b.*, cm.clinic_name${balanceSelect} FROM banks b LEFT JOIN clinic_master cm ON b.clinic_id = cm.id ${balanceJoins}${where} ORDER BY b.bank_name ASC`;
     const result = await pool.query(query, params);
     res.json(result.rows);
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -1063,16 +1091,143 @@ app.delete('/api/banks/:id', async (req, res) => {
     const checkQuery = req.clinicId
       ? `SELECT 1 FROM visits WHERE bank_id = $1 AND clinic_id = $2
          UNION SELECT 1 FROM patient_payments WHERE bank_id = $1 AND clinic_id = $2
-         UNION SELECT 1 FROM daily_ledger WHERE bank_id = $1 AND clinic_id = $2 LIMIT 1`
+         UNION SELECT 1 FROM daily_ledger WHERE bank_id = $1 AND clinic_id = $2
+         UNION SELECT 1 FROM bank_transfers WHERE (from_bank_id = $1 OR to_bank_id = $1) AND clinic_id = $2 LIMIT 1`
       : `SELECT 1 FROM visits WHERE bank_id = $1
          UNION SELECT 1 FROM patient_payments WHERE bank_id = $1
-         UNION SELECT 1 FROM daily_ledger WHERE bank_id = $1 LIMIT 1`;
+         UNION SELECT 1 FROM daily_ledger WHERE bank_id = $1
+         UNION SELECT 1 FROM bank_transfers WHERE (from_bank_id = $1 OR to_bank_id = $1) LIMIT 1`;
     const checkParams = req.clinicId ? [req.params.id, req.clinicId] : [req.params.id];
     const inUse = await pool.query(checkQuery, checkParams);
     if (inUse.rows.length) {
       return res.status(409).json({ error: 'This bank has payments recorded against it and cannot be deleted. Mark it inactive instead.' });
     }
     const query = req.clinicId ? 'DELETE FROM banks WHERE id = $1 AND clinic_id = $2 RETURNING id' : 'DELETE FROM banks WHERE id = $1 RETURNING id';
+    const params = req.clinicId ? [req.params.id, req.clinicId] : [req.params.id];
+    const result = await pool.query(query, params);
+    if (!result.rows.length) return res.status(404).json({ error: 'Not found' });
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ---- BANK TRANSFERS ----
+app.get('/api/bank-transfers', async (req, res) => {
+  try {
+    const { bank_id, date_from, date_to } = req.query;
+    const conditions = [];
+    const params = [];
+    if (req.clinicId) { params.push(req.clinicId); conditions.push(`t.clinic_id = $${params.length}`); }
+    if (bank_id) { params.push(bank_id); conditions.push(`(t.from_bank_id = $${params.length} OR t.to_bank_id = $${params.length})`); }
+    if (date_from) { params.push(date_from); conditions.push(`t.transfer_date >= $${params.length}`); }
+    if (date_to) { params.push(date_to); conditions.push(`t.transfer_date <= $${params.length}`); }
+    const where = conditions.length ? ` WHERE ${conditions.join(' AND ')}` : '';
+    const query = `SELECT t.*, fb.bank_name AS from_bank_name, tb.bank_name AS to_bank_name
+                   FROM bank_transfers t
+                   LEFT JOIN banks fb ON t.from_bank_id = fb.id
+                   LEFT JOIN banks tb ON t.to_bank_id = tb.id
+                   ${where} ORDER BY t.transfer_date DESC, t.created_at DESC`;
+    const result = await pool.query(query, params);
+    res.json(result.rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/bank-transfers/export', async (req, res) => {
+  try {
+    const query = req.clinicId
+      ? `SELECT t.*, fb.bank_name AS from_bank_name, tb.bank_name AS to_bank_name, cm.clinic_name
+         FROM bank_transfers t
+         LEFT JOIN banks fb ON t.from_bank_id = fb.id
+         LEFT JOIN banks tb ON t.to_bank_id = tb.id
+         LEFT JOIN clinic_master cm ON t.clinic_id = cm.id
+         WHERE t.clinic_id = $1 ORDER BY t.transfer_date DESC, t.created_at DESC`
+      : `SELECT t.*, fb.bank_name AS from_bank_name, tb.bank_name AS to_bank_name, cm.clinic_name
+         FROM bank_transfers t
+         LEFT JOIN banks fb ON t.from_bank_id = fb.id
+         LEFT JOIN banks tb ON t.to_bank_id = tb.id
+         LEFT JOIN clinic_master cm ON t.clinic_id = cm.id
+         ORDER BY t.transfer_date DESC, t.created_at DESC`;
+    const params = req.clinicId ? [req.clinicId] : [];
+    const result = await pool.query(query, params);
+    const clinicName = await resolveClinicName(req.clinicId);
+    const columns = [
+      { label: 'Transfer Date', value: r => r.transfer_date },
+      { label: 'From Bank', value: r => r.from_bank_name },
+      { label: 'To Bank', value: r => r.to_bank_name },
+      { label: 'Amount', value: r => r.amount },
+      { label: 'Description', value: r => r.description },
+      { label: 'Created At', value: r => formatTimestamp(r.created_at) },
+    ];
+    if (!req.clinicId) columns.push({ label: 'Clinic Name', value: r => r.clinic_name });
+    sendCsv(res, { module: 'Bank Transfers', clinicName, dateRangeLabel: null, filterLabels: [], columns, rows: result.rows, filenamePrefix: 'bank_transfers' });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/bank-transfers', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { clinic_id, from_bank_id, to_bank_id, transfer_date, amount, description } = req.body;
+    if (!from_bank_id || !to_bank_id) {
+      return res.status(400).json({ error: 'Both from and to bank are required.' });
+    }
+    if (String(from_bank_id) === String(to_bank_id)) {
+      return res.status(400).json({ error: 'From bank and to bank must be different.' });
+    }
+    const numAmount = Number(amount);
+    if (!numAmount || numAmount <= 0) {
+      return res.status(400).json({ error: 'Amount must be greater than zero.' });
+    }
+    if (!transfer_date) {
+      return res.status(400).json({ error: 'Transfer date is required.' });
+    }
+    const targetClinicId = clinic_id || req.clinicId || null;
+
+    await client.query('BEGIN');
+
+    const bankCheck = await client.query(
+      targetClinicId
+        ? 'SELECT id FROM banks WHERE id = ANY($1) AND clinic_id = $2'
+        : 'SELECT id FROM banks WHERE id = ANY($1)',
+      targetClinicId ? [[from_bank_id, to_bank_id], targetClinicId] : [[from_bank_id, to_bank_id]]
+    );
+    if (bankCheck.rows.length !== 2) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Both banks must belong to this clinic.' });
+    }
+
+    // Lock the source bank row so two concurrent transfers from the same bank can't both
+    // pass the balance check before either commits.
+    await client.query('SELECT id FROM banks WHERE id = $1 FOR UPDATE', [from_bank_id]);
+
+    const balanceResult = await client.query(
+      `SELECT COALESCE((SELECT SUM(CASE WHEN entry_type = 'income' THEN amount ELSE -amount END) FROM daily_ledger WHERE bank_id = $1), 0)
+            + COALESCE((SELECT SUM(amount) FROM bank_transfers WHERE to_bank_id = $1), 0)
+            - COALESCE((SELECT SUM(amount) FROM bank_transfers WHERE from_bank_id = $1), 0) AS balance`,
+      [from_bank_id]
+    );
+    const availableBalance = Number(balanceResult.rows[0].balance);
+    if (numAmount > availableBalance) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: `Insufficient balance. Available: ${availableBalance.toFixed(2)}, requested: ${numAmount.toFixed(2)}.` });
+    }
+
+    const result = await client.query(
+      `INSERT INTO bank_transfers (clinic_id, from_bank_id, to_bank_id, transfer_date, amount, description)
+       VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+      [targetClinicId, from_bank_id, to_bank_id, transfer_date, numAmount, description || null]
+    );
+    await client.query('COMMIT');
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.delete('/api/bank-transfers/:id', async (req, res) => {
+  try {
+    const query = req.clinicId ? 'DELETE FROM bank_transfers WHERE id = $1 AND clinic_id = $2 RETURNING id' : 'DELETE FROM bank_transfers WHERE id = $1 RETURNING id';
     const params = req.clinicId ? [req.params.id, req.clinicId] : [req.params.id];
     const result = await pool.query(query, params);
     if (!result.rows.length) return res.status(404).json({ error: 'Not found' });
