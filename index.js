@@ -2196,11 +2196,11 @@ app.get('/api/dashboard', async (req, res) => {
   try {
     const today = new Date().toISOString().split('T')[0];
     const clinicFilter = req.clinicId ? ` AND clinic_id = $${1}` : '';
-    const [todayVisits, todayIncome, totalPatients, monthlyIncome, pendingBalance, recentVisits] = await Promise.all([
+    const [todayVisits, todayIncome, totalPatients, monthlyIncome, pendingBalance, recentVisits, cashOnHand] = await Promise.all([
       pool.query(req.clinicId ? `SELECT COUNT(*) FROM visits WHERE visit_date = $1 AND clinic_id = $2` : `SELECT COUNT(*) FROM visits WHERE visit_date = $1`, [today, ...(req.clinicId ? [req.clinicId] : [])]),
       pool.query(req.clinicId ? `SELECT COALESCE(SUM(amount_paid),0) as total FROM visits WHERE visit_date = $1 AND clinic_id = $2` : `SELECT COALESCE(SUM(amount_paid),0) as total FROM visits WHERE visit_date = $1`, [today, ...(req.clinicId ? [req.clinicId] : [])]),
       pool.query(req.clinicId ? `SELECT COUNT(*) FROM patients WHERE is_active = true AND clinic_id = $1` : `SELECT COUNT(*) FROM patients WHERE is_active = true`, [ ...(req.clinicId ? [req.clinicId] : []) ]),
-      pool.query(req.clinicId ? `SELECT COALESCE(SUM(amount),0) as total FROM daily_ledger WHERE entry_type='income' AND clinic_id = $1 AND DATE_TRUNC('month', entry_date) = DATE_TRUNC('month', NOW())` : `SELECT COALESCE(SUM(amount),0) as total FROM daily_ledger WHERE entry_type='income' AND DATE_TRUNC('month', entry_date) = DATE_TRUNC('month', NOW())`, [ ...(req.clinicId ? [req.clinicId] : []) ]),
+      pool.query(req.clinicId ? `SELECT COALESCE(SUM(amount),0) as total FROM daily_ledger WHERE entry_type='income' AND category != 'Opening Balance' AND clinic_id = $1 AND DATE_TRUNC('month', entry_date) = DATE_TRUNC('month', NOW())` : `SELECT COALESCE(SUM(amount),0) as total FROM daily_ledger WHERE entry_type='income' AND category != 'Opening Balance' AND DATE_TRUNC('month', entry_date) = DATE_TRUNC('month', NOW())`, [ ...(req.clinicId ? [req.clinicId] : []) ]),
       // Clamped per patient: an advance credit must not cancel out other patients' genuine dues.
       pool.query(req.clinicId ? `SELECT COALESCE(SUM(GREATEST(bal,0)),0) as total FROM (
                     SELECT COALESCE((SELECT SUM(fee_charged) FROM visits v WHERE v.patient_id = p.id AND v.clinic_id = $1),0)
@@ -2211,9 +2211,17 @@ app.get('/api/dashboard', async (req, res) => {
                          + COALESCE((SELECT SUM(amount) FROM daily_ledger dl WHERE dl.patient_id = p.id AND dl.category = 'Product Sale'),0)
                          - COALESCE((SELECT SUM(amount) FROM patient_payments pp WHERE pp.patient_id = p.id),0) AS bal
                     FROM patients p) t`, [ ...(req.clinicId ? [req.clinicId] : []) ]),
-      pool.query(req.clinicId ? `SELECT v.*, p.first_name, p.last_name, p.patient_id as pid FROM visits v 
-                  JOIN patients p ON v.patient_id = p.id WHERE v.clinic_id = $1 ORDER BY v.created_at DESC LIMIT 5` : `SELECT v.*, p.first_name, p.last_name, p.patient_id as pid FROM visits v 
+      pool.query(req.clinicId ? `SELECT v.*, p.first_name, p.last_name, p.patient_id as pid FROM visits v
+                  JOIN patients p ON v.patient_id = p.id WHERE v.clinic_id = $1 ORDER BY v.created_at DESC LIMIT 5` : `SELECT v.*, p.first_name, p.last_name, p.patient_id as pid FROM visits v
                   JOIN patients p ON v.patient_id = p.id ORDER BY v.created_at DESC LIMIT 5`, [ ...(req.clinicId ? [req.clinicId] : []) ]),
+      // Running cash-on-hand: all-time cash income minus cash expense (includes Opening Balance entries on purpose).
+      pool.query(req.clinicId ? `SELECT
+                    COALESCE(SUM(CASE WHEN entry_type='income' THEN amount ELSE 0 END),0)
+                  - COALESCE(SUM(CASE WHEN entry_type='expense' THEN amount ELSE 0 END),0) as total
+                  FROM daily_ledger WHERE payment_method='cash' AND clinic_id = $1` : `SELECT
+                    COALESCE(SUM(CASE WHEN entry_type='income' THEN amount ELSE 0 END),0)
+                  - COALESCE(SUM(CASE WHEN entry_type='expense' THEN amount ELSE 0 END),0) as total
+                  FROM daily_ledger WHERE payment_method='cash'`, [ ...(req.clinicId ? [req.clinicId] : []) ]),
     ]);
     const weeklyData = await pool.query(req.clinicId ? `
       SELECT TO_CHAR(gs.day, 'Dy') as day, 
@@ -2236,6 +2244,7 @@ app.get('/api/dashboard', async (req, res) => {
       total_patients: parseInt(totalPatients.rows[0].count),
       monthly_income: parseFloat(monthlyIncome.rows[0].total),
       pending_balance: parseFloat(pendingBalance.rows[0].total),
+      cash_on_hand: parseFloat(cashOnHand.rows[0].total),
       recent_visits: recentVisits.rows,
       weekly_data: weeklyData.rows,
     });
