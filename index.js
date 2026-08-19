@@ -689,6 +689,7 @@ app.post('/api/clinic-users/login', async (req, res) => {
       clinic_name: clinicName,
       currency: clinicCurrency,
       currency_symbol: clinicCurrencySymbol,
+      subscription_valid_until: clinicRow.last_date || null,
     });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
