@@ -102,6 +102,21 @@ function normalizeTherapies(therapies) {
   return { therapies: result, error: null };
 }
 
+function normalizeProductLines(lines) {
+  if (!Array.isArray(lines)) return { productLines: [], error: null };
+  const result = [];
+  for (const l of lines) {
+    const product_id = l?.product_id ? Number(l.product_id) : null;
+    const product_name = String(l?.product_name || '').trim() || null;
+    const description = String(l?.description || '').trim();
+    const amount = Number(l?.amount) || 0;
+    if (!product_id && !description) continue;
+    if (amount <= 0) continue;
+    result.push({ product_id, product_name, description, amount });
+  }
+  return { productLines: result, error: null };
+}
+
 // Balance the patient carries INTO a visit. Positive = dues outstanding, negative = advance credit.
 // excludeVisitId leaves the visit being saved/edited out of both sums so it never counts against itself.
 // `db` may be the pool or a transaction client.
@@ -118,7 +133,7 @@ async function getPriorBalance(db, patientId, clinicId = null, excludeVisitId = 
   const { rows } = await db.query(
     `SELECT (SELECT COALESCE(SUM(fee_charged),0) FROM visits
               WHERE patient_id = $1${clinicSql}${visitExcl})
-          + (SELECT COALESCE(SUM(amount),0) FROM daily_ledger
+          + (SELECT COALESCE(SUM(${productChargedExpr()}),0) FROM daily_ledger
               WHERE patient_id = $1 AND category = 'Product Sale'${clinicSql})
           - (SELECT COALESCE(SUM(amount),0) FROM patient_payments
               WHERE patient_id = $1${clinicSql}${payExcl}) AS balance_due`,
@@ -175,6 +190,34 @@ function getTherapyRows(v) {
 
 function formatTherapies(row) {
   return getTherapyRows(row).map(t => `${t.therapy_type} (${t.duration_minutes}m)`).join('; ');
+}
+
+// Mirrors frontend/src/utils/products.js getProductRows() — kept in sync manually since
+// backend and frontend are separate repos and cannot share this util.
+function getProductRows(row) {
+  if (Array.isArray(row.product_lines) && row.product_lines.length) {
+    return row.product_lines.map(l => ({
+      product_id: l.product_id ?? null,
+      product_name: l.product_name || l.description || 'Product',
+      amount: Number(l.amount) || 0,
+    }));
+  }
+  if (row.product_id || row.product_name) {
+    return [{ product_id: row.product_id ?? null, product_name: row.product_name || row.description || 'Product', amount: Number(row.amount) || 0 }];
+  }
+  return [];
+}
+
+function formatProducts(row) {
+  return getProductRows(row).map(p => `${p.product_name} (${p.amount})`).join('; ');
+}
+
+// Per-row "charged" total for a Product Sale daily_ledger row: sums each product_lines line's
+// amount for rows created after the multi-product consolidation; falls back to the row's own
+// `amount` column for legacy rows (created before this fix, which stored the charged total there).
+function productChargedExpr(alias) {
+  const col = alias ? `${alias}.` : '';
+  return `COALESCE((SELECT SUM((el->>'amount')::numeric) FROM jsonb_array_elements(COALESCE(${col}product_lines,'[]'::jsonb)) el), ${col}amount)`;
 }
 
 function formatDateRangeLabel({ date, date_from, date_to }) {
@@ -425,6 +468,7 @@ async function initDB() {
     ALTER TABLE daily_ledger ADD COLUMN IF NOT EXISTS clinic_id INTEGER REFERENCES clinic_master(id) ON DELETE CASCADE;
     ALTER TABLE daily_ledger ADD COLUMN IF NOT EXISTS product_id INTEGER REFERENCES products(id) ON DELETE SET NULL;
     ALTER TABLE daily_ledger ADD COLUMN IF NOT EXISTS amount_paid NUMERIC(10,2);
+    ALTER TABLE daily_ledger ADD COLUMN IF NOT EXISTS product_lines JSONB;
     ALTER TABLE products ADD COLUMN IF NOT EXISTS clinic_id INTEGER REFERENCES clinic_master(id) ON DELETE CASCADE;
     ALTER TABLE appointments ADD COLUMN IF NOT EXISTS clinic_id INTEGER REFERENCES clinic_master(id) ON DELETE CASCADE;
     ALTER TABLE therapists ADD COLUMN IF NOT EXISTS clinic_id INTEGER REFERENCES clinic_master(id) ON DELETE CASCADE;
@@ -971,9 +1015,10 @@ app.put('/api/products/:id', async (req, res) => {
 
 app.delete('/api/products/:id', async (req, res) => {
   try {
+    const productInLines = `EXISTS (SELECT 1 FROM jsonb_array_elements(COALESCE(product_lines,'[]'::jsonb)) el WHERE (el->>'product_id') = $1::text)`;
     const checkQuery = req.clinicId
-      ? 'SELECT 1 FROM daily_ledger WHERE product_id = $1 AND clinic_id = $2 LIMIT 1'
-      : 'SELECT 1 FROM daily_ledger WHERE product_id = $1 LIMIT 1';
+      ? `SELECT 1 FROM daily_ledger WHERE (product_id = $1 OR ${productInLines}) AND clinic_id = $2 LIMIT 1`
+      : `SELECT 1 FROM daily_ledger WHERE (product_id = $1 OR ${productInLines}) LIMIT 1`;
     const checkParams = req.clinicId ? [req.params.id, req.clinicId] : [req.params.id];
     const inUse = await pool.query(checkQuery, checkParams);
     if (inUse.rows.length) {
@@ -1612,9 +1657,9 @@ app.get('/api/ledger', async (req, res) => {
               to_char(l.entry_date,'YYYY-MM-DD') AS entry_date,
               l.entry_type, l.category, l.description, l.amount, l.payment_method, l.bank_id, bk.bank_name, l.reference_number,
               l.patient_id, l.visit_id, l.created_at,
-              l.product_id, pr.product_name,
+              l.product_id, pr.product_name, l.product_lines,
               p.first_name, p.last_name,
-              COALESCE(v.fee_charged, CASE WHEN l.category = 'Product Sale' THEN l.amount END) AS fee_charged,
+              COALESCE(v.fee_charged, CASE WHEN l.category = 'Product Sale' THEN ${productChargedExpr('l')} END) AS fee_charged,
               COALESCE(v.amount_paid, CASE WHEN l.category = 'Product Sale' THEN l.amount_paid END) AS amount_paid,
               v.therapy_type, v.therapy_types, v.session_notes
            FROM daily_ledger l
@@ -1642,10 +1687,10 @@ app.get('/api/ledger/export', async (req, res) => {
               to_char(l.entry_date,'YYYY-MM-DD') AS entry_date,
               l.entry_type, l.category, l.description, l.amount, l.payment_method, l.bank_id, bk.bank_name, l.reference_number,
               l.patient_id, l.visit_id, l.created_at,
-              l.product_id, pr.product_name,
+              l.product_id, pr.product_name, l.product_lines,
               p.first_name, p.last_name, p.patient_id as patient_code,
               v.therapist_name,
-              COALESCE(v.fee_charged, CASE WHEN l.category = 'Product Sale' THEN l.amount END) AS fee_charged,
+              COALESCE(v.fee_charged, CASE WHEN l.category = 'Product Sale' THEN ${productChargedExpr('l')} END) AS fee_charged,
               COALESCE(v.amount_paid, CASE WHEN l.category = 'Product Sale' THEN l.amount_paid END) AS amount_paid,
               v.therapy_type, v.therapy_types, v.session_notes,
               cm.clinic_name
@@ -1672,7 +1717,7 @@ app.get('/api/ledger/export', async (req, res) => {
     const columns = [
       { label: 'Entry Date', value: r => r.entry_date },
       { label: 'Entry Type', value: r => r.entry_type === 'income' ? 'Income' : 'Expense' },
-      { label: 'Category', value: r => (r.category === 'Product Sale' && r.product_name) ? r.product_name : r.category },
+      { label: 'Category', value: r => r.category === 'Product Sale' ? (formatProducts(r) || r.category) : r.category },
       { label: 'Description', value: r => r.description },
       { label: 'Amount', value: r => r.amount },
       { label: 'Payment Method', value: r => r.payment_method },
@@ -1724,7 +1769,10 @@ app.get('/api/reports', async (req, res) => {
     else if (patient_id) { whereParams.push(patient_id); where += ` AND l.patient_id = $${whereParams.length}`; }
     if (payment_method) { whereParams.push(payment_method); where += ` AND l.payment_method = $${whereParams.length}`; }
     if (bank_id) { whereParams.push(bank_id); where += ` AND l.bank_id = $${whereParams.length}`; }
-    if (product_id) { whereParams.push(product_id); where += ` AND l.product_id = $${whereParams.length}`; }
+    if (product_id) {
+      whereParams.push(product_id);
+      where += ` AND (l.product_id = $${whereParams.length} OR EXISTS (SELECT 1 FROM jsonb_array_elements(COALESCE(l.product_lines,'[]'::jsonb)) el WHERE (el->>'product_id') = $${whereParams.length}::text))`;
+    }
 
     const fromJoin = ` FROM daily_ledger l
            LEFT JOIN patients p ON l.patient_id = p.id
@@ -1767,7 +1815,7 @@ app.get('/api/reports', async (req, res) => {
               to_char(l.entry_date,'YYYY-MM-DD') AS entry_date,
               l.entry_type, l.category, l.description, l.amount, l.payment_method, l.bank_id, bk.bank_name, l.reference_number,
               l.patient_id, l.visit_id, l.created_at,
-              l.product_id, pr.product_name,
+              l.product_id, pr.product_name, l.product_lines,
               p.first_name, p.last_name, v.therapist_name, v.session_notes
            ${fromJoin}${where}
            ORDER BY l.entry_date DESC, l.created_at DESC
@@ -1818,7 +1866,10 @@ app.get('/api/reports/export', async (req, res) => {
     else if (patient_id) { whereParams.push(patient_id); where += ` AND l.patient_id = $${whereParams.length}`; }
     if (payment_method) { whereParams.push(payment_method); where += ` AND l.payment_method = $${whereParams.length}`; }
     if (bank_id) { whereParams.push(bank_id); where += ` AND l.bank_id = $${whereParams.length}`; }
-    if (product_id) { whereParams.push(product_id); where += ` AND l.product_id = $${whereParams.length}`; }
+    if (product_id) {
+      whereParams.push(product_id);
+      where += ` AND (l.product_id = $${whereParams.length} OR EXISTS (SELECT 1 FROM jsonb_array_elements(COALESCE(l.product_lines,'[]'::jsonb)) el WHERE (el->>'product_id') = $${whereParams.length}::text))`;
+    }
 
     const fromJoin = ` FROM daily_ledger l
            LEFT JOIN patients p ON l.patient_id = p.id
@@ -1831,10 +1882,10 @@ app.get('/api/reports/export', async (req, res) => {
               to_char(l.entry_date,'YYYY-MM-DD') AS entry_date,
               l.entry_type, l.category, l.description, l.amount, l.payment_method, l.bank_id, bk.bank_name, l.reference_number,
               l.patient_id, l.visit_id, l.created_at,
-              l.product_id, pr.product_name,
+              l.product_id, pr.product_name, l.product_lines,
               p.first_name, p.last_name, p.patient_id as patient_code,
               v.therapist_name,
-              COALESCE(v.fee_charged, CASE WHEN l.category = 'Product Sale' THEN l.amount END) AS fee_charged,
+              COALESCE(v.fee_charged, CASE WHEN l.category = 'Product Sale' THEN ${productChargedExpr('l')} END) AS fee_charged,
               COALESCE(v.amount_paid, CASE WHEN l.category = 'Product Sale' THEN l.amount_paid END) AS amount_paid,
               v.therapy_type, v.therapy_types, v.session_notes,
               cm.clinic_name
@@ -1857,7 +1908,7 @@ app.get('/api/reports/export', async (req, res) => {
     const columns = [
       { label: 'Entry Date', value: r => r.entry_date },
       { label: 'Entry Type', value: r => r.entry_type === 'income' ? 'Income' : 'Expense' },
-      { label: 'Category / Product', value: r => (r.category === 'Product Sale' && r.product_name) ? r.product_name : r.category },
+      { label: 'Category / Product', value: r => r.category === 'Product Sale' ? (formatProducts(r) || r.category) : r.category },
       { label: 'Description', value: r => r.description },
       { label: 'Patient Code', value: r => r.patient_code },
       { label: 'Patient Name', value: r => r.first_name ? `${r.first_name} ${r.last_name}` : '' },
@@ -1880,23 +1931,41 @@ app.get('/api/reports/export', async (req, res) => {
 app.post('/api/ledger', async (req, res) => {
   const client = await pool.connect();
   try {
-    const { entry_date, entry_type, category, description, amount, amount_paid, payment_method, bank_id, reference_number, patient_id, product_id } = req.body;
+    const { entry_date, entry_type, category, description, amount, amount_paid, payment_method, bank_id, reference_number, patient_id, product_id, product_lines } = req.body;
     const normalizedEntryDate = normalizeDate(entry_date);
     const patientId = patient_id ? patient_id : null;
-    const productId = product_id ? product_id : null;
     const resolvedBankId = payment_method === 'online' ? (bank_id || null) : null;
     // Product Sale carries a charged/paid split (partial payment at time of sale) just like visit fees;
     // every other category still treats the single `amount` typed as the amount paid.
     const isProductSale = category === 'Product Sale';
+
+    let productId = product_id ? product_id : null;
+    let totalCharged = amount;
+    let normalizedProductLines = null;
+    if (isProductSale) {
+      const { productLines, error: productLinesError } = normalizeProductLines(product_lines);
+      if (productLinesError) return res.status(400).json({ error: productLinesError });
+      if (!productLines.length) return res.status(400).json({ error: 'Add at least one product with a description and amount.' });
+      normalizedProductLines = productLines;
+      totalCharged = productLines.reduce((s, l) => s + l.amount, 0);
+      productId = productLines[0].product_id || null;
+    }
     const paidNow = isProductSale ? Number(amount_paid || 0) : Number(amount || 0);
+    if (isProductSale && paidNow > totalCharged) {
+      return res.status(400).json({ error: 'Paid amount cannot exceed the total charged.' });
+    }
+    // `amount`/`amount_paid` both store what was actually collected now — matching every other
+    // category and visit-linked ledger rows. The full charged total (for a partially-paid sale)
+    // lives only in `product_lines`; see productChargedExpr() for how it's re-derived on read.
+    const storedAmount = isProductSale ? paidNow : amount;
 
     await client.query('BEGIN');
 
     // insert into daily ledger
     const result = await client.query(
-      `INSERT INTO daily_ledger (clinic_id, entry_date, entry_type, category, description, amount, amount_paid, payment_method, bank_id, reference_number, patient_id, product_id)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`,
-      [req.clinicId || null, normalizedEntryDate, entry_type, category, description, amount, isProductSale ? paidNow : amount, payment_method, resolvedBankId, reference_number, patientId, productId]
+      `INSERT INTO daily_ledger (clinic_id, entry_date, entry_type, category, description, amount, amount_paid, payment_method, bank_id, reference_number, patient_id, product_id, product_lines)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb) RETURNING *`,
+      [req.clinicId || null, normalizedEntryDate, entry_type, category, description, storedAmount, storedAmount, payment_method, resolvedBankId, reference_number, patientId, productId, normalizedProductLines ? JSON.stringify(normalizedProductLines) : null]
     );
     const ledgerEntry = result.rows[0];
 
@@ -1974,7 +2043,7 @@ app.get('/api/patient-ledger/:patient_id', async (req, res) => {
                   COUNT(*) AS total_visits
            FROM visits WHERE patient_id = $1 AND clinic_id = $2
          ), product_sum AS (
-           SELECT COALESCE(SUM(amount),0) AS total_charged
+           SELECT COALESCE(SUM(${productChargedExpr()}),0) AS total_charged
            FROM daily_ledger WHERE patient_id = $1 AND category = 'Product Sale' AND clinic_id = $2
          ), payments_sum AS (
            SELECT COALESCE(SUM(amount),0) AS total_paid
@@ -1990,7 +2059,7 @@ app.get('/api/patient-ledger/:patient_id', async (req, res) => {
                   COUNT(*) AS total_visits
            FROM visits WHERE patient_id = $1
          ), product_sum AS (
-           SELECT COALESCE(SUM(amount),0) AS total_charged
+           SELECT COALESCE(SUM(${productChargedExpr()}),0) AS total_charged
            FROM daily_ledger WHERE patient_id = $1 AND category = 'Product Sale'
          ), payments_sum AS (
            SELECT COALESCE(SUM(amount),0) AS total_paid
@@ -2109,7 +2178,7 @@ app.get('/api/patient-dues', async (req, res) => {
         GROUP BY patient_id
       ) v ON v.patient_id = p.id
       LEFT JOIN (
-        SELECT patient_id, SUM(amount) AS total_charged
+        SELECT patient_id, SUM(${productChargedExpr()}) AS total_charged
         FROM daily_ledger
         WHERE category = 'Product Sale'${clinicFilter}
         GROUP BY patient_id
@@ -2156,7 +2225,7 @@ app.get('/api/patient-dues/export', async (req, res) => {
         GROUP BY patient_id
       ) v ON v.patient_id = p.id
       LEFT JOIN (
-        SELECT patient_id, SUM(amount) AS total_charged
+        SELECT patient_id, SUM(${productChargedExpr()}) AS total_charged
         FROM daily_ledger
         WHERE category = 'Product Sale'${clinicFilter}
         GROUP BY patient_id
@@ -2205,11 +2274,11 @@ app.get('/api/dashboard', async (req, res) => {
       // Clamped per patient: an advance credit must not cancel out other patients' genuine dues.
       pool.query(req.clinicId ? `SELECT COALESCE(SUM(GREATEST(bal,0)),0) as total FROM (
                     SELECT COALESCE((SELECT SUM(fee_charged) FROM visits v WHERE v.patient_id = p.id AND v.clinic_id = $1),0)
-                         + COALESCE((SELECT SUM(amount) FROM daily_ledger dl WHERE dl.patient_id = p.id AND dl.category = 'Product Sale' AND dl.clinic_id = $1),0)
+                         + COALESCE((SELECT SUM(${productChargedExpr('dl')}) FROM daily_ledger dl WHERE dl.patient_id = p.id AND dl.category = 'Product Sale' AND dl.clinic_id = $1),0)
                          - COALESCE((SELECT SUM(amount) FROM patient_payments pp WHERE pp.patient_id = p.id AND pp.clinic_id = $1),0) AS bal
                     FROM patients p WHERE p.clinic_id = $1) t` : `SELECT COALESCE(SUM(GREATEST(bal,0)),0) as total FROM (
                     SELECT COALESCE((SELECT SUM(fee_charged) FROM visits v WHERE v.patient_id = p.id),0)
-                         + COALESCE((SELECT SUM(amount) FROM daily_ledger dl WHERE dl.patient_id = p.id AND dl.category = 'Product Sale'),0)
+                         + COALESCE((SELECT SUM(${productChargedExpr('dl')}) FROM daily_ledger dl WHERE dl.patient_id = p.id AND dl.category = 'Product Sale'),0)
                          - COALESCE((SELECT SUM(amount) FROM patient_payments pp WHERE pp.patient_id = p.id),0) AS bal
                     FROM patients p) t`, [ ...(req.clinicId ? [req.clinicId] : []) ]),
       pool.query(req.clinicId ? `SELECT v.*, p.first_name, p.last_name, p.patient_id as pid FROM visits v
