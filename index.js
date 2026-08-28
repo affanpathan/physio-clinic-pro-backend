@@ -109,10 +109,11 @@ function normalizeProductLines(lines) {
     const product_id = l?.product_id ? Number(l.product_id) : null;
     const product_name = String(l?.product_name || '').trim() || null;
     const description = String(l?.description || '').trim();
+    const quantity = Math.max(1, parseInt(l?.quantity, 10) || 1);
     const amount = Number(l?.amount) || 0;
     if (!product_id && !description) continue;
     if (amount <= 0) continue;
-    result.push({ product_id, product_name, description, amount });
+    result.push({ product_id, product_name, description, quantity, amount });
   }
   return { productLines: result, error: null };
 }
@@ -199,17 +200,18 @@ function getProductRows(row) {
     return row.product_lines.map(l => ({
       product_id: l.product_id ?? null,
       product_name: l.product_name || l.description || 'Product',
+      quantity: Number(l.quantity) || 1,
       amount: Number(l.amount) || 0,
     }));
   }
   if (row.product_id || row.product_name) {
-    return [{ product_id: row.product_id ?? null, product_name: row.product_name || row.description || 'Product', amount: Number(row.amount) || 0 }];
+    return [{ product_id: row.product_id ?? null, product_name: row.product_name || row.description || 'Product', quantity: 1, amount: Number(row.amount) || 0 }];
   }
   return [];
 }
 
 function formatProducts(row) {
-  return getProductRows(row).map(p => `${p.product_name} (${p.amount})`).join('; ');
+  return getProductRows(row).map(p => `${p.product_name}${p.quantity > 1 ? ` x${p.quantity}` : ''} (${p.amount})`).join('; ');
 }
 
 // Per-row "charged" total for a Product Sale daily_ledger row: sums each product_lines line's
