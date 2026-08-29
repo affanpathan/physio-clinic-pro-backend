@@ -1815,6 +1815,27 @@ app.get('/api/reports', async (req, res) => {
       expense: Number(r.expense),
     }));
 
+    const cashResult = await pool.query(
+      `SELECT COALESCE(SUM(CASE WHEN l.entry_type = 'income' THEN l.amount ELSE 0 END), 0) AS income,
+              COALESCE(SUM(CASE WHEN l.entry_type = 'expense' THEN l.amount ELSE 0 END), 0) AS expense
+       ${fromJoin}${where} AND l.payment_method = 'cash'`,
+      whereParams
+    );
+    // All-time cash position (not date-scoped), mirroring the dashboard's cash_on_hand calc.
+    const cashBalanceResult = await pool.query(
+      req.clinicId
+        ? `SELECT COALESCE(SUM(CASE WHEN entry_type='income' THEN amount ELSE -amount END),0) AS balance
+           FROM daily_ledger WHERE payment_method='cash' AND clinic_id = $1`
+        : `SELECT COALESCE(SUM(CASE WHEN entry_type='income' THEN amount ELSE -amount END),0) AS balance
+           FROM daily_ledger WHERE payment_method='cash'`,
+      req.clinicId ? [req.clinicId] : []
+    );
+    const cash = {
+      income: Number(cashResult.rows[0].income),
+      expense: Number(cashResult.rows[0].expense),
+      balance: Number(cashBalanceResult.rows[0].balance),
+    };
+
     const dataParams = [...whereParams, pageSize, (page - 1) * pageSize];
     const dataQuery = `SELECT l.id,
               to_char(l.entry_date,'YYYY-MM-DD') AS entry_date,
@@ -1840,6 +1861,7 @@ app.get('/api/reports', async (req, res) => {
         cashAmount: Number(summaryRow.cash_amount),
         onlineAmount: Number(summaryRow.online_amount),
         byBank,
+        cash,
       },
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
