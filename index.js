@@ -1498,12 +1498,14 @@ app.post('/api/visits', async (req, res) => {
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
         [req.clinicId || null, patient_id, visit.id, normalizedVisitDate, amount_paid, payment_method, resolvedBankId, `Visit payment - ${normalizedVisitDate}`]
       );
-      await client.query(
-        `INSERT INTO daily_ledger (clinic_id, entry_date, entry_type, category, description, amount, payment_method, bank_id, patient_id, visit_id)
-         VALUES ($1,$2,'income','Therapy Fee',$3,$4,$5,$6,$7,$8)`,
-        [req.clinicId || null, normalizedVisitDate, `Therapy fee - ${legacyTherapyType}`, amount_paid, payment_method, resolvedBankId, patient_id, visit.id]
-      );
     }
+    // Always record the visit in the daily ledger, even when unpaid (amount_paid=0), so it
+    // shows up in Daily Ledger/Reports like any other visit — not just paid ones.
+    await client.query(
+      `INSERT INTO daily_ledger (clinic_id, entry_date, entry_type, category, description, amount, payment_method, bank_id, patient_id, visit_id)
+       VALUES ($1,$2,'income','Therapy Fee',$3,$4,$5,$6,$7,$8)`,
+      [req.clinicId || null, normalizedVisitDate, `Therapy fee - ${legacyTherapyType}`, amount_paid || 0, payment_method, resolvedBankId, patient_id, visit.id]
+    );
     await client.query('COMMIT');
     res.status(201).json(visit);
   } catch (err) {
@@ -1590,12 +1592,13 @@ app.put('/api/visits/:id', async (req, res) => {
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
         [req.clinicId || null, visit.patient_id, visit.id, normalizedVisitDate, amount_paid, payment_method, resolvedBankId, `Visit payment - ${normalizedVisitDate}`]
       );
-      await client.query(
-        `INSERT INTO daily_ledger (clinic_id, entry_date, entry_type, category, description, amount, payment_method, bank_id, patient_id, visit_id)
-         VALUES ($1,$2,'income','Therapy Fee',$3,$4,$5,$6,$7,$8)`,
-        [req.clinicId || null, normalizedVisitDate, `Therapy fee - ${legacyTherapyType}`, amount_paid, payment_method, resolvedBankId, visit.patient_id, visit.id]
-      );
     }
+    // Always record the visit in the daily ledger, even when unpaid (amount_paid=0) — see POST /api/visits.
+    await client.query(
+      `INSERT INTO daily_ledger (clinic_id, entry_date, entry_type, category, description, amount, payment_method, bank_id, patient_id, visit_id)
+       VALUES ($1,$2,'income','Therapy Fee',$3,$4,$5,$6,$7,$8)`,
+      [req.clinicId || null, normalizedVisitDate, `Therapy fee - ${legacyTherapyType}`, amount_paid || 0, payment_method, resolvedBankId, visit.patient_id, visit.id]
+    );
 
     await client.query('COMMIT');
     res.json(visit);
