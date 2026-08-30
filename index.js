@@ -2027,6 +2027,101 @@ app.post('/api/ledger', async (req, res) => {
   } finally { client.release(); }
 });
 
+// Edit a Daily-Ledger-module entry. Only rows created from this module (visit_id IS NULL)
+// are editable here; visit-linked "Therapy Fee" rows are edited from the Visits page. The
+// entry's original entry_date is preserved - it is never moved to the day of the edit.
+app.put('/api/ledger/:id', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { entry_type, category, description, amount, amount_paid, discount, payment_method, bank_id, reference_number, patient_id, product_id, product_lines } = req.body;
+    const patientId = patient_id ? patient_id : null;
+    const resolvedBankId = payment_method === 'online' ? (bank_id || null) : null;
+    const isProductSale = category === 'Product Sale';
+
+    let productId = product_id ? product_id : null;
+    let totalCharged = amount;
+    let normalizedProductLines = null;
+    if (isProductSale) {
+      const { productLines, error: productLinesError } = normalizeProductLines(product_lines);
+      if (productLinesError) return res.status(400).json({ error: productLinesError });
+      if (!productLines.length) return res.status(400).json({ error: 'Add at least one product with a description and amount.' });
+      normalizedProductLines = productLines;
+      totalCharged = productLines.reduce((s, l) => s + l.amount, 0);
+      productId = productLines[0].product_id || null;
+    }
+    const discountAmt = isProductSale ? Math.max(0, Number(discount) || 0) : 0;
+    if (isProductSale && discountAmt > totalCharged) {
+      return res.status(400).json({ error: 'Discount cannot exceed the product total.' });
+    }
+    const netCharged = totalCharged - discountAmt;
+    const paidNow = isProductSale ? Number(amount_paid || 0) : Number(amount || 0);
+    if (isProductSale && paidNow > netCharged) {
+      return res.status(400).json({ error: 'Paid amount cannot exceed the discounted total.' });
+    }
+    const storedAmount = isProductSale ? paidNow : amount;
+    const storedDiscount = isProductSale ? discountAmt : null;
+
+    await client.query('BEGIN');
+
+    const existing = await client.query(
+      req.clinicId ? 'SELECT * FROM daily_ledger WHERE id=$1 AND clinic_id=$2' : 'SELECT * FROM daily_ledger WHERE id=$1',
+      req.clinicId ? [req.params.id, req.clinicId] : [req.params.id]
+    );
+    if (!existing.rows.length) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Entry not found' });
+    }
+    const row = existing.rows[0];
+    if (row.visit_id) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Visit-linked entries are edited from the Visits page.' });
+    }
+
+    // Keep the original date; only gate on how far ahead it is.
+    const keptEntryDate = normalizeDate(row.entry_date);
+    const maxEditable = new Date();
+    maxEditable.setDate(maxEditable.getDate() + 2);
+    if (keptEntryDate > maxEditable.toISOString().slice(0, 10)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'You can only edit entries dated up to 2 days ahead.' });
+    }
+
+    // entry_date is intentionally omitted from SET - it stays as originally recorded.
+    const updated = await client.query(
+      req.clinicId
+        ? `UPDATE daily_ledger SET entry_type=$1, category=$2, description=$3, amount=$4, amount_paid=$5, discount=$6, payment_method=$7, bank_id=$8, reference_number=$9, patient_id=$10, product_id=$11, product_lines=$12::jsonb
+           WHERE id=$13 AND clinic_id=$14 AND visit_id IS NULL RETURNING *`
+        : `UPDATE daily_ledger SET entry_type=$1, category=$2, description=$3, amount=$4, amount_paid=$5, discount=$6, payment_method=$7, bank_id=$8, reference_number=$9, patient_id=$10, product_id=$11, product_lines=$12::jsonb
+           WHERE id=$13 AND visit_id IS NULL RETURNING *`,
+      req.clinicId
+        ? [entry_type, category, description, storedAmount, storedAmount, storedDiscount, payment_method, resolvedBankId, reference_number, patientId, productId, normalizedProductLines ? JSON.stringify(normalizedProductLines) : null, req.params.id, req.clinicId]
+        : [entry_type, category, description, storedAmount, storedAmount, storedDiscount, payment_method, resolvedBankId, reference_number, patientId, productId, normalizedProductLines ? JSON.stringify(normalizedProductLines) : null, req.params.id]
+    );
+    if (!updated.rows.length) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Entry not found' });
+    }
+    const ledgerEntry = updated.rows[0];
+
+    // Re-sync the patient payment linked to this ledger entry (delete then re-create),
+    // mirroring POST /api/ledger + DELETE /api/ledger so patient dues stay in step.
+    await client.query('DELETE FROM patient_payments WHERE ledger_id=$1', [ledgerEntry.id]);
+    if (entry_type === 'income' && patientId && paidNow > 0) {
+      await client.query(
+        `INSERT INTO patient_payments (clinic_id, patient_id, visit_id, ledger_id, payment_date, amount, payment_method, bank_id, reference_number, notes)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+        [req.clinicId || null, patientId, null, ledgerEntry.id, keptEntryDate, paidNow, payment_method, resolvedBankId, reference_number, description]
+      );
+    }
+
+    await client.query('COMMIT');
+    res.json(ledgerEntry);
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: err.message });
+  } finally { client.release(); }
+});
+
 app.delete('/api/ledger/:id', async (req, res) => {
   const client = await pool.connect();
   try {
