@@ -217,9 +217,12 @@ function formatProducts(row) {
 // Per-row "charged" total for a Product Sale daily_ledger row: sums each product_lines line's
 // amount for rows created after the multi-product consolidation; falls back to the row's own
 // `amount` column for legacy rows (created before this fix, which stored the charged total there).
+// A whole-sale discount stored on the row is netted off so every dues/balance calc that goes
+// through this expression sees what the patient actually owes. Legacy rows have discount NULL,
+// so the subtraction is a no-op for them.
 function productChargedExpr(alias) {
   const col = alias ? `${alias}.` : '';
-  return `COALESCE((SELECT SUM((el->>'amount')::numeric) FROM jsonb_array_elements(COALESCE(${col}product_lines,'[]'::jsonb)) el), ${col}amount)`;
+  return `(COALESCE((SELECT SUM((el->>'amount')::numeric) FROM jsonb_array_elements(COALESCE(${col}product_lines,'[]'::jsonb)) el), ${col}amount) - COALESCE(${col}discount, 0))`;
 }
 
 function formatDateRangeLabel({ date, date_from, date_to }) {
@@ -470,6 +473,7 @@ async function initDB() {
     ALTER TABLE daily_ledger ADD COLUMN IF NOT EXISTS clinic_id INTEGER REFERENCES clinic_master(id) ON DELETE CASCADE;
     ALTER TABLE daily_ledger ADD COLUMN IF NOT EXISTS product_id INTEGER REFERENCES products(id) ON DELETE SET NULL;
     ALTER TABLE daily_ledger ADD COLUMN IF NOT EXISTS amount_paid NUMERIC(10,2);
+    ALTER TABLE daily_ledger ADD COLUMN IF NOT EXISTS discount NUMERIC(10,2);
     ALTER TABLE daily_ledger ADD COLUMN IF NOT EXISTS product_lines JSONB;
     ALTER TABLE products ADD COLUMN IF NOT EXISTS clinic_id INTEGER REFERENCES clinic_master(id) ON DELETE CASCADE;
     ALTER TABLE appointments ADD COLUMN IF NOT EXISTS clinic_id INTEGER REFERENCES clinic_master(id) ON DELETE CASCADE;
@@ -1660,7 +1664,7 @@ app.get('/api/ledger', async (req, res) => {
     const { date, date_from, date_to } = req.query;
     let query = `SELECT l.id,
               to_char(l.entry_date,'YYYY-MM-DD') AS entry_date,
-              l.entry_type, l.category, l.description, l.amount, l.payment_method, l.bank_id, bk.bank_name, l.reference_number,
+              l.entry_type, l.category, l.description, l.amount, l.discount, l.payment_method, l.bank_id, bk.bank_name, l.reference_number,
               l.patient_id, l.visit_id, l.created_at,
               l.product_id, pr.product_name, l.product_lines,
               p.first_name, p.last_name,
@@ -1690,7 +1694,7 @@ app.get('/api/ledger/export', async (req, res) => {
     const { date, date_from, date_to, entry_type } = req.query;
     let query = `SELECT l.id,
               to_char(l.entry_date,'YYYY-MM-DD') AS entry_date,
-              l.entry_type, l.category, l.description, l.amount, l.payment_method, l.bank_id, bk.bank_name, l.reference_number,
+              l.entry_type, l.category, l.description, l.amount, l.discount, l.payment_method, l.bank_id, bk.bank_name, l.reference_number,
               l.patient_id, l.visit_id, l.created_at,
               l.product_id, pr.product_name, l.product_lines,
               p.first_name, p.last_name, p.patient_id as patient_code,
@@ -1732,6 +1736,7 @@ app.get('/api/ledger/export', async (req, res) => {
       { label: 'Patient Name', value: r => r.first_name ? `${r.first_name} ${r.last_name}` : '' },
       { label: 'Therapist', value: r => r.therapist_name },
       { label: 'Therapy Type(s)', value: r => r.visit_id ? formatTherapies(r) : '' },
+      { label: 'Discount', value: r => r.discount },
       { label: 'Fee Charged', value: r => r.fee_charged },
       { label: 'Amount Paid', value: r => r.amount_paid },
       { label: 'Session Notes', value: r => r.session_notes },
@@ -1958,7 +1963,7 @@ app.get('/api/reports/export', async (req, res) => {
 app.post('/api/ledger', async (req, res) => {
   const client = await pool.connect();
   try {
-    const { entry_date, entry_type, category, description, amount, amount_paid, payment_method, bank_id, reference_number, patient_id, product_id, product_lines } = req.body;
+    const { entry_date, entry_type, category, description, amount, amount_paid, discount, payment_method, bank_id, reference_number, patient_id, product_id, product_lines } = req.body;
     const normalizedEntryDate = normalizeDate(entry_date);
     const patientId = patient_id ? patient_id : null;
     const resolvedBankId = payment_method === 'online' ? (bank_id || null) : null;
@@ -1977,22 +1982,30 @@ app.post('/api/ledger', async (req, res) => {
       totalCharged = productLines.reduce((s, l) => s + l.amount, 0);
       productId = productLines[0].product_id || null;
     }
+    // Whole-sale flat discount (Product Sale only): netted off the product total to get what the
+    // patient owes. Stored on the row so it shows in the ledger and is re-derived by productChargedExpr().
+    const discountAmt = isProductSale ? Math.max(0, Number(discount) || 0) : 0;
+    if (isProductSale && discountAmt > totalCharged) {
+      return res.status(400).json({ error: 'Discount cannot exceed the product total.' });
+    }
+    const netCharged = totalCharged - discountAmt;
     const paidNow = isProductSale ? Number(amount_paid || 0) : Number(amount || 0);
-    if (isProductSale && paidNow > totalCharged) {
-      return res.status(400).json({ error: 'Paid amount cannot exceed the total charged.' });
+    if (isProductSale && paidNow > netCharged) {
+      return res.status(400).json({ error: 'Paid amount cannot exceed the discounted total.' });
     }
     // `amount`/`amount_paid` both store what was actually collected now — matching every other
     // category and visit-linked ledger rows. The full charged total (for a partially-paid sale)
     // lives only in `product_lines`; see productChargedExpr() for how it's re-derived on read.
     const storedAmount = isProductSale ? paidNow : amount;
+    const storedDiscount = isProductSale ? discountAmt : null;
 
     await client.query('BEGIN');
 
     // insert into daily ledger
     const result = await client.query(
-      `INSERT INTO daily_ledger (clinic_id, entry_date, entry_type, category, description, amount, amount_paid, payment_method, bank_id, reference_number, patient_id, product_id, product_lines)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb) RETURNING *`,
-      [req.clinicId || null, normalizedEntryDate, entry_type, category, description, storedAmount, storedAmount, payment_method, resolvedBankId, reference_number, patientId, productId, normalizedProductLines ? JSON.stringify(normalizedProductLines) : null]
+      `INSERT INTO daily_ledger (clinic_id, entry_date, entry_type, category, description, amount, amount_paid, discount, payment_method, bank_id, reference_number, patient_id, product_id, product_lines)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb) RETURNING *`,
+      [req.clinicId || null, normalizedEntryDate, entry_type, category, description, storedAmount, storedAmount, storedDiscount, payment_method, resolvedBankId, reference_number, patientId, productId, normalizedProductLines ? JSON.stringify(normalizedProductLines) : null]
     );
     const ledgerEntry = result.rows[0];
 
