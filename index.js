@@ -2009,13 +2009,14 @@ app.post('/api/ledger', async (req, res) => {
     );
     const ledgerEntry = result.rows[0];
 
-    // If this is an income entry for a patient, also record a patient payment (for the amount actually
-    // collected now) so the patient's dues reflect it. Product Sale dues club with visit dues.
-    if (entry_type === 'income' && patientId && paidNow > 0) {
+    // Keep patient-linked income and refunds in the payment ledger so the patient's balance stays current.
+    const recordsPatientPayment = entry_type === 'income' || (entry_type === 'expense' && category === 'Refund');
+    if (recordsPatientPayment && patientId && paidNow > 0) {
+      const patientPaymentAmount = entry_type === 'expense' ? -paidNow : paidNow;
       await client.query(
         `INSERT INTO patient_payments (clinic_id, patient_id, visit_id, ledger_id, payment_date, amount, payment_method, bank_id, reference_number, notes)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-        [req.clinicId || null, patientId, null, ledgerEntry.id, normalizedEntryDate, paidNow, payment_method, resolvedBankId, reference_number, description]
+        [req.clinicId || null, patientId, null, ledgerEntry.id, normalizedEntryDate, patientPaymentAmount, payment_method, resolvedBankId, reference_number, description]
       );
     }
 
@@ -2106,11 +2107,13 @@ app.put('/api/ledger/:id', async (req, res) => {
     // Re-sync the patient payment linked to this ledger entry (delete then re-create),
     // mirroring POST /api/ledger + DELETE /api/ledger so patient dues stay in step.
     await client.query('DELETE FROM patient_payments WHERE ledger_id=$1', [ledgerEntry.id]);
-    if (entry_type === 'income' && patientId && paidNow > 0) {
+    const recordsPatientPayment = entry_type === 'income' || (entry_type === 'expense' && category === 'Refund');
+    if (recordsPatientPayment && patientId && paidNow > 0) {
+      const patientPaymentAmount = entry_type === 'expense' ? -paidNow : paidNow;
       await client.query(
         `INSERT INTO patient_payments (clinic_id, patient_id, visit_id, ledger_id, payment_date, amount, payment_method, bank_id, reference_number, notes)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-        [req.clinicId || null, patientId, null, ledgerEntry.id, keptEntryDate, paidNow, payment_method, resolvedBankId, reference_number, description]
+        [req.clinicId || null, patientId, null, ledgerEntry.id, keptEntryDate, patientPaymentAmount, payment_method, resolvedBankId, reference_number, description]
       );
     }
 
