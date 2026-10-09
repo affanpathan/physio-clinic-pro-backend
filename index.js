@@ -1214,6 +1214,24 @@ app.get('/api/bank-transfers/export', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+async function lockAndGetBankBalance(client, bankId, clinicId) {
+  const bankResult = await client.query(
+    clinicId
+      ? 'SELECT id FROM banks WHERE id = $1 AND clinic_id = $2 FOR UPDATE'
+      : 'SELECT id FROM banks WHERE id = $1 FOR UPDATE',
+    clinicId ? [bankId, clinicId] : [bankId]
+  );
+  if (!bankResult.rows.length) return null;
+
+  const balanceResult = await client.query(
+    `SELECT COALESCE((SELECT SUM(CASE WHEN entry_type = 'income' THEN amount ELSE -amount END) FROM daily_ledger WHERE bank_id = $1), 0)
+          + COALESCE((SELECT SUM(amount) FROM bank_transfers WHERE to_bank_id = $1), 0)
+          - COALESCE((SELECT SUM(amount) FROM bank_transfers WHERE from_bank_id = $1), 0) AS balance`,
+    [bankId]
+  );
+  return Number(balanceResult.rows[0].balance || 0);
+}
+
 app.post('/api/bank-transfers', async (req, res) => {
   const client = await pool.connect();
   try {
@@ -2001,6 +2019,22 @@ app.post('/api/ledger', async (req, res) => {
 
     await client.query('BEGIN');
 
+    if (entry_type === 'expense' && payment_method === 'online') {
+      if (!resolvedBankId) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'Select a bank for online expenses.' });
+      }
+      const availableBalance = await lockAndGetBankBalance(client, resolvedBankId, req.clinicId);
+      if (availableBalance === null) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'Selected bank is unavailable.' });
+      }
+      if (Number(amount) > availableBalance) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: `Insufficient balance. Available: ${availableBalance.toFixed(2)}, requested: ${Number(amount).toFixed(2)}.` });
+      }
+    }
+
     // insert into daily ledger
     const result = await client.query(
       `INSERT INTO daily_ledger (clinic_id, entry_date, entry_type, category, description, amount, amount_paid, discount, payment_method, bank_id, reference_number, patient_id, product_id, product_lines)
@@ -2076,6 +2110,26 @@ app.put('/api/ledger/:id', async (req, res) => {
     if (row.visit_id) {
       await client.query('ROLLBACK');
       return res.status(400).json({ error: 'Visit-linked entries are edited from the Visits page.' });
+    }
+
+    if (entry_type === 'expense' && payment_method === 'online') {
+      if (!resolvedBankId) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'Select a bank for online expenses.' });
+      }
+      let availableBalance = await lockAndGetBankBalance(client, resolvedBankId, req.clinicId);
+      if (availableBalance === null) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'Selected bank is unavailable.' });
+      }
+      if (String(row.bank_id) === String(resolvedBankId)) {
+        const oldEntryEffect = (row.entry_type === 'income' ? 1 : -1) * (Number(row.amount) || 0);
+        availableBalance -= oldEntryEffect;
+      }
+      if (Number(amount) > availableBalance) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: `Insufficient balance. Available: ${availableBalance.toFixed(2)}, requested: ${Number(amount).toFixed(2)}.` });
+      }
     }
 
     // Keep the original date; only gate on how far ahead it is.
