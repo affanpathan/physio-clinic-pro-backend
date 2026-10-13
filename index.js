@@ -1568,17 +1568,13 @@ app.put('/api/visits/:id', async (req, res) => {
 
     const existing = await client.query(
       req.clinicId
-        ? 'SELECT patient_id, amount_paid, (visit_date = CURRENT_DATE) AS is_today FROM visits WHERE id=$1 AND clinic_id=$2'
-        : 'SELECT patient_id, amount_paid, (visit_date = CURRENT_DATE) AS is_today FROM visits WHERE id=$1',
+        ? 'SELECT patient_id FROM visits WHERE id=$1 AND clinic_id=$2'
+        : 'SELECT patient_id FROM visits WHERE id=$1',
       req.clinicId ? [req.params.id, req.clinicId] : [req.params.id]
     );
     if (!existing.rows.length) {
       await client.query('ROLLBACK');
       return res.status(404).json({ error: 'Not found' });
-    }
-    if (!existing.rows[0].is_today && Number(amount_paid || 0) !== Number(existing.rows[0].amount_paid)) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ error: 'Paid amount can only be edited on the day of the visit.' });
     }
 
     // Exclude this visit from the balance so its own fee/payment never count against it.
