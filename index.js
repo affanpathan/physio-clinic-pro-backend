@@ -2228,6 +2228,22 @@ app.get('/api/patient-ledger/:patient_id', async (req, res) => {
         : `SELECT pp.id, pp.visit_id, to_char(pp.payment_date,'YYYY-MM-DD') AS payment_date, pp.amount, pp.payment_method, pp.reference_number, pp.notes, pp.created_at, 'payment' as record_type FROM patient_payments pp WHERE pp.patient_id = $1 ORDER BY pp.payment_date DESC`,
       req.clinicId ? [req.params.patient_id, req.clinicId] : [req.params.patient_id]
     );
+    const productSales = await pool.query(
+      req.clinicId
+        ? `SELECT dl.id, to_char(dl.entry_date,'YYYY-MM-DD') AS sale_date, dl.product_id, p.product_name,
+              dl.product_lines, dl.description, dl.amount_paid, dl.discount, dl.payment_method,
+              dl.reference_number, dl.created_at, ${productChargedExpr('dl')} AS total_charged
+           FROM daily_ledger dl LEFT JOIN products p ON p.id = dl.product_id
+           WHERE dl.patient_id = $1 AND dl.category = 'Product Sale' AND dl.clinic_id = $2
+           ORDER BY dl.entry_date DESC, dl.created_at DESC`
+        : `SELECT dl.id, to_char(dl.entry_date,'YYYY-MM-DD') AS sale_date, dl.product_id, p.product_name,
+              dl.product_lines, dl.description, dl.amount_paid, dl.discount, dl.payment_method,
+              dl.reference_number, dl.created_at, ${productChargedExpr('dl')} AS total_charged
+           FROM daily_ledger dl LEFT JOIN products p ON p.id = dl.product_id
+           WHERE dl.patient_id = $1 AND dl.category = 'Product Sale'
+           ORDER BY dl.entry_date DESC, dl.created_at DESC`,
+      req.clinicId ? [req.params.patient_id, req.clinicId] : [req.params.patient_id]
+    );
     const summary = await pool.query(
       req.clinicId
         ? `WITH visits_sum AS (
@@ -2265,13 +2281,13 @@ app.get('/api/patient-ledger/:patient_id', async (req, res) => {
       req.clinicId ? [req.params.patient_id, req.clinicId] : [req.params.patient_id]
     );
     // console.log(visits, payments, summary);
-    res.json({ visits: visits.rows, payments: payments.rows, summary: summary.rows[0] });
+    res.json({ visits: visits.rows, payments: payments.rows, product_sales: productSales.rows, summary: summary.rows[0] });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.get('/api/patient-ledger/:patient_id/export', async (req, res) => {
   try {
-    const type = req.query.type === 'payments' ? 'payments' : 'visits';
+    const type = ['payments', 'product-sales'].includes(req.query.type) ? req.query.type : 'visits';
     const patientLookup = await pool.query(
       req.clinicId ? 'SELECT first_name, last_name, patient_id FROM patients WHERE id = $1 AND clinic_id = $2' : 'SELECT first_name, last_name, patient_id FROM patients WHERE id = $1',
       req.clinicId ? [req.params.patient_id, req.clinicId] : [req.params.patient_id]
@@ -2298,6 +2314,37 @@ app.get('/api/patient-ledger/:patient_id/export', async (req, res) => {
         { label: 'Created At', value: r => formatTimestamp(r.created_at) },
       ];
       return sendCsv(res, { module: 'Patient Ledger — Payments', clinicName, dateRangeLabel: null, filterLabels, columns, rows: payments.rows, filenamePrefix: 'patient-ledger-payments' });
+    }
+
+    if (type === 'product-sales') {
+      const sales = await pool.query(
+        req.clinicId
+          ? `SELECT dl.id, to_char(dl.entry_date,'YYYY-MM-DD') AS sale_date, dl.product_id, p.product_name,
+                dl.product_lines, dl.description, dl.amount_paid, dl.discount, dl.payment_method,
+                dl.reference_number, ${productChargedExpr('dl')} AS total_charged
+             FROM daily_ledger dl LEFT JOIN products p ON p.id = dl.product_id
+             WHERE dl.patient_id = $1 AND dl.category = 'Product Sale' AND dl.clinic_id = $2
+             ORDER BY dl.entry_date DESC, dl.created_at DESC`
+          : `SELECT dl.id, to_char(dl.entry_date,'YYYY-MM-DD') AS sale_date, dl.product_id, p.product_name,
+                dl.product_lines, dl.description, dl.amount_paid, dl.discount, dl.payment_method,
+                dl.reference_number, ${productChargedExpr('dl')} AS total_charged
+             FROM daily_ledger dl LEFT JOIN products p ON p.id = dl.product_id
+             WHERE dl.patient_id = $1 AND dl.category = 'Product Sale'
+             ORDER BY dl.entry_date DESC, dl.created_at DESC`,
+        req.clinicId ? [req.params.patient_id, req.clinicId] : [req.params.patient_id]
+      );
+      const columns = [
+        { label: 'Sale Date', value: r => r.sale_date },
+        { label: 'Products', value: r => Array.isArray(r.product_lines) && r.product_lines.length
+          ? r.product_lines.map(line => `${line.product_name || line.description || 'Product'} x${Number(line.quantity) || 1} (${line.amount})`).join('; ')
+          : r.product_name || r.description },
+        { label: 'Total Charged', value: r => r.total_charged },
+        { label: 'Discount', value: r => r.discount },
+        { label: 'Amount Paid', value: r => r.amount_paid },
+        { label: 'Payment Method', value: r => r.payment_method },
+        { label: 'Reference Number', value: r => r.reference_number },
+      ];
+      return sendCsv(res, { module: 'Patient Ledger — Product Sales', clinicName, dateRangeLabel: null, filterLabels, columns, rows: sales.rows, filenamePrefix: 'patient-ledger-product-sales' });
     }
 
     const visits = await pool.query(
