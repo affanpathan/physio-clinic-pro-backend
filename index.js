@@ -345,6 +345,7 @@ async function initDB() {
       clinic_id INTEGER REFERENCES clinic_master(id) ON DELETE CASCADE,
       patient_id INTEGER REFERENCES patients(id) ON DELETE CASCADE,
       visit_id INTEGER REFERENCES visits(id) ON DELETE SET NULL,
+      category VARCHAR(100),
       payment_date DATE NOT NULL,
       amount NUMERIC(10,2) NOT NULL,
       payment_method VARCHAR(20) NOT NULL,
@@ -470,6 +471,17 @@ async function initDB() {
     END $$;
     ALTER TABLE patient_payments ADD COLUMN IF NOT EXISTS clinic_id INTEGER REFERENCES clinic_master(id) ON DELETE CASCADE;
     ALTER TABLE patient_payments ADD COLUMN IF NOT EXISTS ledger_id INTEGER REFERENCES daily_ledger(id) ON DELETE SET NULL;
+    ALTER TABLE patient_payments ADD COLUMN IF NOT EXISTS category VARCHAR(100);
+    DO $$
+    BEGIN
+      IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'patient_payments' AND column_name = 'category' AND data_type = 'ARRAY'
+      ) THEN
+        ALTER TABLE patient_payments ALTER COLUMN category TYPE VARCHAR(100)
+        USING array_to_string(category, ', ');
+      END IF;
+    END $$;
     ALTER TABLE daily_ledger ADD COLUMN IF NOT EXISTS clinic_id INTEGER REFERENCES clinic_master(id) ON DELETE CASCADE;
     ALTER TABLE daily_ledger ADD COLUMN IF NOT EXISTS product_id INTEGER REFERENCES products(id) ON DELETE SET NULL;
     ALTER TABLE daily_ledger ADD COLUMN IF NOT EXISTS amount_paid NUMERIC(10,2);
@@ -2044,9 +2056,9 @@ app.post('/api/ledger', async (req, res) => {
     if (recordsPatientPayment && patientId && paidNow > 0) {
       const patientPaymentAmount = entry_type === 'expense' ? -paidNow : paidNow;
       await client.query(
-        `INSERT INTO patient_payments (clinic_id, patient_id, visit_id, ledger_id, payment_date, amount, payment_method, bank_id, reference_number, notes)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-        [req.clinicId || null, patientId, null, ledgerEntry.id, normalizedEntryDate, patientPaymentAmount, payment_method, resolvedBankId, reference_number, description]
+        `INSERT INTO patient_payments (clinic_id, patient_id, visit_id, ledger_id, category, payment_date, amount, payment_method, bank_id, reference_number, notes)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+        [req.clinicId || null, patientId, null, ledgerEntry.id, category, normalizedEntryDate, patientPaymentAmount, payment_method, resolvedBankId, reference_number, description]
       );
     }
 
@@ -2161,9 +2173,9 @@ app.put('/api/ledger/:id', async (req, res) => {
     if (recordsPatientPayment && patientId && paidNow > 0) {
       const patientPaymentAmount = entry_type === 'expense' ? -paidNow : paidNow;
       await client.query(
-        `INSERT INTO patient_payments (clinic_id, patient_id, visit_id, ledger_id, payment_date, amount, payment_method, bank_id, reference_number, notes)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-        [req.clinicId || null, patientId, null, ledgerEntry.id, keptEntryDate, patientPaymentAmount, payment_method, resolvedBankId, reference_number, description]
+        `INSERT INTO patient_payments (clinic_id, patient_id, visit_id, ledger_id, category, payment_date, amount, payment_method, bank_id, reference_number, notes)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+        [req.clinicId || null, patientId, null, ledgerEntry.id, category, keptEntryDate, patientPaymentAmount, payment_method, resolvedBankId, reference_number, description]
       );
     }
 
@@ -2220,23 +2232,23 @@ app.get('/api/patient-ledger/:patient_id', async (req, res) => {
     );
     const payments = await pool.query(
       req.clinicId
-        ? `SELECT pp.id, pp.visit_id, to_char(pp.payment_date,'YYYY-MM-DD') AS payment_date, pp.amount, pp.payment_method, pp.reference_number, pp.notes, pp.created_at, 'payment' as record_type FROM patient_payments pp WHERE pp.patient_id = $1 AND pp.clinic_id = $2 ORDER BY pp.payment_date DESC`
-        : `SELECT pp.id, pp.visit_id, to_char(pp.payment_date,'YYYY-MM-DD') AS payment_date, pp.amount, pp.payment_method, pp.reference_number, pp.notes, pp.created_at, 'payment' as record_type FROM patient_payments pp WHERE pp.patient_id = $1 ORDER BY pp.payment_date DESC`,
+        ? `SELECT pp.id, pp.visit_id, to_char(pp.payment_date,'YYYY-MM-DD') AS payment_date, pp.amount, pp.payment_method, pp.reference_number, pp.notes, pp.created_at, 'payment' as record_type FROM patient_payments pp LEFT JOIN daily_ledger dl ON dl.id = pp.ledger_id WHERE pp.patient_id = $1 AND pp.clinic_id = $2 AND pp.category IS DISTINCT FROM 'Product Sale Payment' AND dl.category IS DISTINCT FROM 'Product Sale Payment' ORDER BY pp.payment_date DESC`
+        : `SELECT pp.id, pp.visit_id, to_char(pp.payment_date,'YYYY-MM-DD') AS payment_date, pp.amount, pp.payment_method, pp.reference_number, pp.notes, pp.created_at, 'payment' as record_type FROM patient_payments pp LEFT JOIN daily_ledger dl ON dl.id = pp.ledger_id WHERE pp.patient_id = $1 AND pp.category IS DISTINCT FROM 'Product Sale Payment' AND dl.category IS DISTINCT FROM 'Product Sale Payment' ORDER BY pp.payment_date DESC`,
       req.clinicId ? [req.params.patient_id, req.clinicId] : [req.params.patient_id]
     );
     const productSales = await pool.query(
       req.clinicId
-        ? `SELECT dl.id, to_char(dl.entry_date,'YYYY-MM-DD') AS sale_date, dl.product_id, p.product_name,
+        ? `SELECT dl.id, dl.category, to_char(dl.entry_date,'YYYY-MM-DD') AS sale_date, dl.product_id, p.product_name,
               dl.product_lines, dl.description, dl.amount_paid, dl.discount, dl.payment_method,
-              dl.reference_number, dl.created_at, ${productChargedExpr('dl')} AS total_charged
+            dl.reference_number, dl.created_at, CASE WHEN dl.category = 'Product Sale' THEN ${productChargedExpr('dl')} END AS total_charged
            FROM daily_ledger dl LEFT JOIN products p ON p.id = dl.product_id
-           WHERE dl.patient_id = $1 AND dl.category = 'Product Sale' AND dl.clinic_id = $2
+          WHERE dl.patient_id = $1 AND dl.category IN ('Product Sale', 'Product Sale Payment') AND dl.clinic_id = $2
            ORDER BY dl.entry_date DESC, dl.created_at DESC`
-        : `SELECT dl.id, to_char(dl.entry_date,'YYYY-MM-DD') AS sale_date, dl.product_id, p.product_name,
+        : `SELECT dl.id, dl.category, to_char(dl.entry_date,'YYYY-MM-DD') AS sale_date, dl.product_id, p.product_name,
               dl.product_lines, dl.description, dl.amount_paid, dl.discount, dl.payment_method,
-              dl.reference_number, dl.created_at, ${productChargedExpr('dl')} AS total_charged
+            dl.reference_number, dl.created_at, CASE WHEN dl.category = 'Product Sale' THEN ${productChargedExpr('dl')} END AS total_charged
            FROM daily_ledger dl LEFT JOIN products p ON p.id = dl.product_id
-           WHERE dl.patient_id = $1 AND dl.category = 'Product Sale'
+          WHERE dl.patient_id = $1 AND dl.category IN ('Product Sale', 'Product Sale Payment')
            ORDER BY dl.entry_date DESC, dl.created_at DESC`,
       req.clinicId ? [req.params.patient_id, req.clinicId] : [req.params.patient_id]
     );
@@ -2297,8 +2309,8 @@ app.get('/api/patient-ledger/:patient_id/export', async (req, res) => {
     if (type === 'payments') {
       const payments = await pool.query(
         req.clinicId
-          ? `SELECT pp.id, pp.visit_id, to_char(pp.payment_date,'YYYY-MM-DD') AS payment_date, pp.amount, pp.payment_method, pp.reference_number, pp.notes, pp.created_at FROM patient_payments pp WHERE pp.patient_id = $1 AND pp.clinic_id = $2 ORDER BY pp.payment_date DESC`
-          : `SELECT pp.id, pp.visit_id, to_char(pp.payment_date,'YYYY-MM-DD') AS payment_date, pp.amount, pp.payment_method, pp.reference_number, pp.notes, pp.created_at FROM patient_payments pp WHERE pp.patient_id = $1 ORDER BY pp.payment_date DESC`,
+          ? `SELECT pp.id, pp.visit_id, to_char(pp.payment_date,'YYYY-MM-DD') AS payment_date, pp.amount, pp.payment_method, pp.reference_number, pp.notes, pp.created_at FROM patient_payments pp LEFT JOIN daily_ledger dl ON dl.id = pp.ledger_id WHERE pp.patient_id = $1 AND pp.clinic_id = $2 AND pp.category IS DISTINCT FROM 'Product Sale Payment' AND dl.category IS DISTINCT FROM 'Product Sale Payment' ORDER BY pp.payment_date DESC`
+          : `SELECT pp.id, pp.visit_id, to_char(pp.payment_date,'YYYY-MM-DD') AS payment_date, pp.amount, pp.payment_method, pp.reference_number, pp.notes, pp.created_at FROM patient_payments pp LEFT JOIN daily_ledger dl ON dl.id = pp.ledger_id WHERE pp.patient_id = $1 AND pp.category IS DISTINCT FROM 'Product Sale Payment' AND dl.category IS DISTINCT FROM 'Product Sale Payment' ORDER BY pp.payment_date DESC`,
         req.clinicId ? [req.params.patient_id, req.clinicId] : [req.params.patient_id]
       );
       const columns = [
@@ -2315,17 +2327,17 @@ app.get('/api/patient-ledger/:patient_id/export', async (req, res) => {
     if (type === 'product-sales') {
       const sales = await pool.query(
         req.clinicId
-          ? `SELECT dl.id, to_char(dl.entry_date,'YYYY-MM-DD') AS sale_date, dl.product_id, p.product_name,
+         ? `SELECT dl.id, dl.category, to_char(dl.entry_date,'YYYY-MM-DD') AS sale_date, dl.product_id, p.product_name,
                 dl.product_lines, dl.description, dl.amount_paid, dl.discount, dl.payment_method,
-                dl.reference_number, ${productChargedExpr('dl')} AS total_charged
+             dl.reference_number, CASE WHEN dl.category = 'Product Sale' THEN ${productChargedExpr('dl')} END AS total_charged
              FROM daily_ledger dl LEFT JOIN products p ON p.id = dl.product_id
-             WHERE dl.patient_id = $1 AND dl.category = 'Product Sale' AND dl.clinic_id = $2
+           WHERE dl.patient_id = $1 AND dl.category IN ('Product Sale', 'Product Sale Payment') AND dl.clinic_id = $2
              ORDER BY dl.entry_date DESC, dl.created_at DESC`
-          : `SELECT dl.id, to_char(dl.entry_date,'YYYY-MM-DD') AS sale_date, dl.product_id, p.product_name,
+         : `SELECT dl.id, dl.category, to_char(dl.entry_date,'YYYY-MM-DD') AS sale_date, dl.product_id, p.product_name,
                 dl.product_lines, dl.description, dl.amount_paid, dl.discount, dl.payment_method,
-                dl.reference_number, ${productChargedExpr('dl')} AS total_charged
+             dl.reference_number, CASE WHEN dl.category = 'Product Sale' THEN ${productChargedExpr('dl')} END AS total_charged
              FROM daily_ledger dl LEFT JOIN products p ON p.id = dl.product_id
-             WHERE dl.patient_id = $1 AND dl.category = 'Product Sale'
+           WHERE dl.patient_id = $1 AND dl.category IN ('Product Sale', 'Product Sale Payment')
              ORDER BY dl.entry_date DESC, dl.created_at DESC`,
         req.clinicId ? [req.params.patient_id, req.clinicId] : [req.params.patient_id]
       );
@@ -2333,7 +2345,7 @@ app.get('/api/patient-ledger/:patient_id/export', async (req, res) => {
         { label: 'Sale Date', value: r => r.sale_date },
         { label: 'Products', value: r => Array.isArray(r.product_lines) && r.product_lines.length
           ? r.product_lines.map(line => `${line.product_name || line.description || 'Product'} x${Number(line.quantity) || 1} (${line.amount})`).join('; ')
-          : r.product_name || r.description },
+          : r.product_name || r.description || r.category },
         { label: 'Total Charged', value: r => r.total_charged },
         { label: 'Discount', value: r => r.discount },
         { label: 'Amount Paid', value: r => r.amount_paid },
